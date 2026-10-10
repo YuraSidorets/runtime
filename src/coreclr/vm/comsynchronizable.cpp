@@ -26,6 +26,7 @@
 #include "callhelpers.h"
 #include "appdomain.hpp"
 #include "appdomain.inl"
+#include "distributedthread.h"
 
 #ifndef TARGET_UNIX
 #include "utilcode.h"
@@ -215,6 +216,77 @@ static ULONG WINAPI KickOffThread(void* pass)
     return 0;
 }
 
+// These entrypoints exist in every CoreLib build so the feature-disabled managed
+// branch never depends on a missing QCall symbol.
+extern "C" BOOL QCALLTYPE ThreadNative_DistributedTryReserveStart(QCall::ObjectHandleOnStack thread)
+{
+    QCALL_CONTRACT;
+    BOOL reserved = FALSE;
+    BEGIN_QCALL;
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+    GCX_COOP();
+    reserved = DistributedThreadTryReserveSource(thread) ? TRUE : FALSE;
+#endif
+    END_QCALL;
+    return reserved;
+}
+
+extern "C" void QCALLTYPE ThreadNative_DistributedStart(
+    QCall::ObjectHandleOnStack thread, QCall::ObjectHandleOnStack startDelegate)
+{
+    QCALL_CONTRACT;
+    BEGIN_QCALL;
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+    GCX_COOP();
+    DistributedThreadStartSource(thread, startDelegate);
+#endif
+    END_QCALL;
+}
+
+extern "C" void QCALLTYPE ThreadNative_DistributedRejectStart()
+{
+    QCALL_CONTRACT;
+    BEGIN_QCALL;
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+    GCX_COOP();
+    DistributedThreadRejectSourceStart();
+#endif
+    END_QCALL;
+}
+
+extern "C" void QCALLTYPE ThreadNative_DistributedWorkerEnter(QCall::ObjectHandleOnStack thread)
+{
+    QCALL_CONTRACT;
+    BEGIN_QCALL;
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+    GCX_COOP();
+    DistributedThreadEnterCallback(thread);
+#endif
+    END_QCALL;
+}
+
+extern "C" void QCALLTYPE ThreadNative_DistributedCallbackReturned()
+{
+    QCALL_CONTRACT;
+    BEGIN_QCALL;
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+    GCX_COOP();
+    DistributedThreadCallbackReturned();
+#endif
+    END_QCALL;
+}
+
+extern "C" void QCALLTYPE ThreadNative_DistributedCallbackFailed()
+{
+    QCALL_CONTRACT;
+    BEGIN_QCALL;
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+    GCX_COOP();
+    DistributedThreadCallbackFailed();
+#endif
+    END_QCALL;
+}
+
 extern "C" void QCALLTYPE ThreadNative_Start(QCall::ThreadHandle thread, int threadStackSize, int priority, BOOL isThreadPool, PCWSTR pThreadName)
 {
     QCALL_CONTRACT;
@@ -224,12 +296,31 @@ extern "C" void QCALLTYPE ThreadNative_Start(QCall::ThreadHandle thread, int thr
     Thread* pNewThread = thread;
     _ASSERTE(pNewThread != NULL);
 
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+    if (DistributedThreadIsReservedSource(pNewThread))
+    {
+        DistributedThreadRejectSourceStart();
+        COMPlusThrow(kInvalidOperationException);
+    }
+#endif
+
     // Is the thread already started?  You can't restart a thread.
     if (!ThreadNotStarted(pNewThread))
     {
         COMPlusThrow(kThreadStateException, W("ThreadState_AlreadyStarted"));
     }
 
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+    // The distributed child must claim execution and hand off directory ownership
+    // before OS-thread creation. No new failure point is added after CreateNewThread.
+    if (!DistributedThreadBeforeCreate(pNewThread))
+    {
+        COMPlusThrow(kInvalidOperationException);
+    }
+#endif
+
+    EX_TRY
+    {
 #ifdef FEATURE_COMINTEROP_APARTMENT_SUPPORT
     // Attempt to eagerly set the apartment state during thread startup.
     Thread::ApartmentState as = pNewThread->GetApartmentOfUnstartedThread();
@@ -255,6 +346,9 @@ extern "C" void QCALLTYPE ThreadNative_Start(QCall::ThreadHandle thread, int thr
 
     if (!success)
     {
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+        DistributedThreadCancelWorkerCallbackStart(pNewThread);
+#endif
         pNewThread->DecExternalCount(FALSE);
         COMPlusThrowOM();
     }
@@ -293,11 +387,24 @@ extern "C" void QCALLTYPE ThreadNative_Start(QCall::ThreadHandle thread, int thr
 
     if (pNewThread->HasThreadState(Thread::TS_FailStarted))
     {
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+        DistributedThreadCancelWorkerCallbackStart(pNewThread);
+#endif
         GCX_COOP();
 
         PulseAllHelper(pNewThread);
         pNewThread->HandleThreadStartupFailure();
     }
+    }
+    EX_CATCH
+    {
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+        // Cancel only if the callback has not consumed its pre-create reservation.
+        DistributedThreadCancelWorkerCallbackStart(pNewThread);
+#endif
+        EX_RETHROW;
+    }
+    EX_END_CATCH
 
     END_QCALL;
 }
@@ -632,7 +739,19 @@ extern "C" BOOL QCALLTYPE ThreadNative_Join(QCall::ObjectHandleOnStack thread, I
     BEGIN_QCALL;
 
     GCX_COOP();
-    retVal = DoJoin((THREADBASEREF)thread.Get(), Timeout);
+    THREADBASEREF joinTarget = (THREADBASEREF)thread.Get();
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+    if (joinTarget != NULL &&
+        DistributedThreadWaitForCompletion(joinTarget->GetInternal(), Timeout, &retVal))
+    {
+        // The reserved source Thread joins through the distributed completion event.
+        // The worker staging thread uses ordinary local Join on its physical child.
+    }
+    else
+#endif
+    {
+        retVal = DoJoin(joinTarget, Timeout);
+    }
 
     END_QCALL;
 

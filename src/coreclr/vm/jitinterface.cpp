@@ -7,6 +7,9 @@
 
 #include "common.h"
 #include "jitinterface.h"
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+#include "distributedaccess.h"
+#endif
 #include "codeman.h"
 #include "method.hpp"
 #include "class.h"
@@ -1542,6 +1545,20 @@ void CEEInfo::getFieldInfo (CORINFO_RESOLVED_TOKEN * pResolvedToken,
     }
     else
     {
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+        if (DistributedAccessIsField(pField))
+        {
+            if (flags & CORINFO_ACCESS_ADDRESS)
+                COMPlusThrow(kInvalidProgramException);
+            bool store = (flags & CORINFO_ACCESS_SET) != 0;
+            bool scalar = pField->GetFieldType() == ELEMENT_TYPE_I4;
+            fieldAccessor = CORINFO_FIELD_INSTANCE_HELPER;
+            pResult->helper = scalar
+                ? (store ? CORINFO_HELP_DISTRIBUTED_SETFIELD_I4 : CORINFO_HELP_DISTRIBUTED_GETFIELD_I4)
+                : (store ? CORINFO_HELP_DISTRIBUTED_SETFIELD_REF : CORINFO_HELP_DISTRIBUTED_GETFIELD_REF);
+        }
+        else
+#endif
         if (pField->IsEnCNew())
         {
             fieldAccessor = CORINFO_FIELD_INSTANCE_ADDR_HELPER;
@@ -6527,8 +6544,16 @@ DWORD CEEInfo::getMethodAttribsInternal (CORINFO_METHOD_HANDLE ftn)
         }
     }
 
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+    if (DistributedAccessIsMethod(pMD))
+        result |= CORINFO_FLG_DONT_INLINE_CALLER;
+#endif
     // Check for an inlining directive.
-    if (pMD->IsNotInline())
+    if (pMD->IsNotInline()
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+        || DistributedAccessIsMethod(pMD)
+#endif
+       )
     {
         /* Function marked as not inlineable */
         result |= CORINFO_FLG_DONT_INLINE;
@@ -7659,6 +7684,10 @@ COR_ILMETHOD_DECODER* CEEInfo::getMethodInfoWorker(
         cxt.UpdateWith({});
     }
 
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+    if (DistributedAccessIsMethod(ftn))
+        methInfo->options = CorInfoOptions(methInfo->options | CORINFO_OPT_DISTRIBUTED_ACCESS);
+#endif
     return ilHeader;
 } // getMethodInfoWorker
 

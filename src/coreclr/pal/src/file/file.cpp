@@ -22,6 +22,7 @@ SET_DEFAULT_DEBUG_CHANNEL(FILE); // some headers have code with asserts, so do t
 
 #include "pal/palinternal.h"
 #include "pal/file.h"
+#include "pal_stdout_capture_lease.h"
 #include "pal/filetime.h"
 #include "pal/utils.h"
 
@@ -1402,6 +1403,100 @@ GetStdHandle(
     LOGEXIT("GetStdHandle returns HANDLE %p\n", hRet);
     PERF_EXIT(GetStdHandle);
     return hRet;
+}
+
+// This is intentionally a narrow internal seam for CoreCLR's bounded
+// application-output capture. ReferenceObjectByHandle pins the exact PAL file
+// object, so its unix_fd cannot be closed and reused while the lease is held.
+BOOL
+PALAPI
+PALAcquireStdoutCaptureLease(
+    OUT PAL_STDOUT_CAPTURE_LEASE *lease)
+{
+    CPalThread *pThread = InternalGetCurrentThread();
+    IPalObject *pFileObject = NULL;
+    IDataLock *pDataLock = NULL;
+    CFileProcessLocalData *pLocalData = NULL;
+    PAL_ERROR palError = NO_ERROR;
+
+    if (lease == NULL)
+    {
+        return FALSE;
+    }
+
+    lease->object = NULL;
+    lease->descriptor = -1;
+    if (pThread == NULL || pStdOut == INVALID_HANDLE_VALUE || g_pObjectManager == NULL)
+    {
+        return FALSE;
+    }
+
+    palError = g_pObjectManager->ReferenceObjectByHandle(
+        pThread,
+        pStdOut,
+        &aotFile,
+        &pFileObject);
+    if (NO_ERROR != palError)
+    {
+        goto done;
+    }
+
+    palError = pFileObject->GetProcessLocalData(
+        pThread,
+        ReadLock,
+        &pDataLock,
+        reinterpret_cast<void**>(&pLocalData));
+    if (NO_ERROR != palError)
+    {
+        goto done;
+    }
+
+    if (pLocalData == NULL || pLocalData->unix_fd < 0)
+    {
+        palError = ERROR_INVALID_HANDLE;
+        goto done;
+    }
+
+    lease->descriptor = pLocalData->unix_fd;
+    pDataLock->ReleaseLock(pThread, FALSE);
+    pDataLock = NULL;
+    lease->object = pFileObject;
+    pFileObject = NULL;
+
+done:
+    if (pDataLock != NULL)
+    {
+        pDataLock->ReleaseLock(pThread, FALSE);
+    }
+    if (pFileObject != NULL)
+    {
+        pFileObject->ReleaseReference(pThread);
+    }
+    if (NO_ERROR != palError)
+    {
+        lease->object = NULL;
+        lease->descriptor = -1;
+    }
+    return NO_ERROR == palError;
+}
+
+VOID
+PALAPI
+PALReleaseStdoutCaptureLease(
+    IN OUT PAL_STDOUT_CAPTURE_LEASE *lease)
+{
+    if (lease == NULL)
+    {
+        return;
+    }
+
+    IPalObject *pFileObject = static_cast<IPalObject*>(lease->object);
+    lease->object = NULL;
+    lease->descriptor = -1;
+    if (pFileObject != NULL)
+    {
+        pFileObject->ReleaseReference(InternalGetCurrentThread());
+    }
 }
 
 //

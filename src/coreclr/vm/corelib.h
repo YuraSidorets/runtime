@@ -654,6 +654,13 @@ DEFINE_METHOD(OBJECT,               TO_STRING,              ToString,           
 DEFINE_METHOD(OBJECT,               GET_TYPE,               GetType,                    IM_RetType)
 DEFINE_METHOD(OBJECT,               GET_HASH_CODE,          GetHashCode,                IM_RetInt)
 DEFINE_METHOD(OBJECT,               EQUALS,                 Equals,                     IM_Obj_RetBool)
+DEFINE_METHOD(OBJECT, DISTRIBUTED_GETFIELD_I4,  DistributedGetFieldInt32,     SM_Obj_IntPtr_RetInt)
+DEFINE_METHOD(OBJECT, DISTRIBUTED_SETFIELD_I4,  DistributedSetFieldInt32,     SM_Obj_IntPtr_Int_RetVoid)
+DEFINE_METHOD(OBJECT, DISTRIBUTED_GETFIELD_REF, DistributedGetFieldReference, SM_Obj_IntPtr_RetObj)
+DEFINE_METHOD(OBJECT, DISTRIBUTED_SETFIELD_REF, DistributedSetFieldReference, SM_Obj_IntPtr_Obj_RetVoid)
+DEFINE_METHOD(OBJECT, DISTRIBUTED_LDELEM_I4,    DistributedGetArrayInt32,     SM_Obj_IntPtr_RetInt)
+DEFINE_METHOD(OBJECT, DISTRIBUTED_STELEM_I4,    DistributedSetArrayInt32,     SM_Obj_IntPtr_Int_RetVoid)
+DEFINE_METHOD(OBJECT, DISTRIBUTED_ACCESS_INVOKE, DistributedAccessInvokeForTest, SM_Obj_Obj_Int_IntPtr_RetInt)
 
 DEFINE_CLASS(__CANON,              System,                 __Canon)
 
@@ -977,7 +984,10 @@ DEFINE_FIELD_U(_isThreadPool,             ThreadBaseObject,   m_IsThreadPool)
 DEFINE_CLASS(DIRECTONTHREADLOCALDATA, Threading, Thread+DirectOnThreadLocalData)
 
 DEFINE_CLASS(THREAD,                Threading,              Thread)
+DEFINE_CLASS(THREADSTART,           Threading,              ThreadStart)
 DEFINE_METHOD(THREAD,               START_CALLBACK,                          StartCallback,                               IM_RetVoid)
+DEFINE_METHOD(THREAD,               DISTRIBUTED_CREATE_WORKER,                CreateDistributedWorker,                     SM_ThreadStart_RetThread)
+DEFINE_METHOD(THREAD,               DISTRIBUTED_RUN_WORKER,                   RunDistributedWorker,                        SM_Thread_RetVoid)
 DEFINE_METHOD(THREAD,               POLLGC,                                  PollGC,                               NoSig)
 
 #ifdef FEATURE_OBJCMARSHAL

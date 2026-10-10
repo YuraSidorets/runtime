@@ -12,6 +12,10 @@
 ===========================================================*/
 
 #include "common.h"
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+#include "distributedadmission.h"
+#include "distributedthread.h"
+#endif
 
 #include <stdlib.h>
 
@@ -1353,6 +1357,13 @@ INT32 Assembly::ExecuteMainMethod(PTRARRAYREF *stringArgs, BOOL waitForOtherThre
     }
     CONTRACTL_END;
 
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+    {
+        GCX_PREEMP();
+        if (!DistributedAdmissionConsumeMain())
+            COMPlusThrowHR(HOST_E_INVALIDOPERATION);
+    }
+#endif
     // reset the error code for std C
     errno=0;
 
@@ -1404,6 +1415,23 @@ INT32 Assembly::ExecuteMainMethod(PTRARRAYREF *stringArgs, BOOL waitForOtherThre
 
             RunManagedStartup();
 
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+            bool mainStartRecorded;
+            {
+                GCX_PREEMP();
+                mainStartRecorded = DistributedAdmissionRecordMainStarted();
+            }
+            if (!mainStartRecorded)
+            {
+                Thread::CleanUpForManagedThreadInNative(pThread);
+                COMPlusThrowHR(HOST_E_INVALIDOPERATION);
+            }
+            if (DistributedAdmissionIsThreadProbe() && !DistributedThreadBeginMain(pThread))
+            {
+                Thread::CleanUpForManagedThreadInNative(pThread);
+                COMPlusThrowHR(HOST_E_INVALIDOPERATION);
+            }
+#endif
             hr = RunMain(pMeth, 1, &iRetVal, stringArgs);
 
             Thread::CleanUpForManagedThreadInNative(pThread);

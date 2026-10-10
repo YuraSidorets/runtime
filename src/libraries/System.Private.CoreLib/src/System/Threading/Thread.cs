@@ -30,6 +30,8 @@ namespace System.Threading
             internal CultureInfo? _culture;
             internal CultureInfo? _uiCulture;
             internal ExecutionContext? _executionContext;
+            internal bool _distributedWorker;
+            internal bool _distributedCallbackFailed;
 
             internal StartHelper(Delegate start)
             {
@@ -98,8 +100,17 @@ namespace System.Threading
                         parameterizedThreadStart(startArg);
                     }
                 }
-                catch (Exception ex) when (ExceptionHandling.IsHandledByGlobalHandler(ex))
+                catch (Exception ex) when (_distributedWorker || ExceptionHandling.IsHandledByGlobalHandler(ex))
                 {
+#if CORECLR
+                    if (_distributedWorker)
+                    {
+                        // Record the callback outcome before the QCall: if it throws
+                        // after side effects, StartCallback must not retry an uncertain report.
+                        _distributedCallbackFailed = true;
+                        NotifyDistributedCallbackFailed();
+                    }
+#endif
                     // the handler returned "true" means the exception is now "handled" and we should gracefully exit.
                 }
 
@@ -216,6 +227,13 @@ namespace System.Threading
 #endif
             ThrowIfNoThreadStart();
 
+#if CORECLR
+            if (TryStartDistributed(captureContext, parameterizedStart: true, parameter))
+            {
+                return;
+            }
+#endif
+
             StartHelper? startHelper = _startHelper;
 
             // In the case of a null startHelper (second call to start on same thread)
@@ -258,6 +276,14 @@ namespace System.Threading
         private void Start(bool captureContext)
         {
             ThrowIfNoThreadStart();
+
+#if CORECLR
+            if (TryStartDistributed(captureContext, parameterizedStart: false, parameter: null))
+            {
+                return;
+            }
+#endif
+
             StartHelper? startHelper = _startHelper;
 
             // In the case of a null startHelper (second call to start on same thread)

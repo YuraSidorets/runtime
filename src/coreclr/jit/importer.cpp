@@ -7204,6 +7204,8 @@ void Compiler::impImportBlockCode(BasicBlock* block)
 
             case CEE_LDELEMA:
             {
+                if (info.compMethodInfo->options & CORINFO_OPT_DISTRIBUTED_ACCESS)
+                    BADCODE("Distributed access profile forbids escaping array element addresses");
                 assertImp(sz == sizeof(unsigned));
 
                 _impResolveToken(CORINFO_TOKENKIND_Class);
@@ -7300,6 +7302,15 @@ void Compiler::impImportBlockCode(BasicBlock* block)
                 op2 = impPopStack().val; // index
                 op1 = impPopStack().val; // array
                 assertImp(op1->TypeIs(TYP_REF));
+
+                if ((info.compMethodInfo->options & CORINFO_OPT_DISTRIBUTED_ACCESS) &&
+                    lclTyp == TYP_INT && opcode != CEE_LDELEMA)
+                {
+                    op2 = impImplicitIorI4Cast(op2, TYP_I_IMPL);
+                    op1 = gtNewHelperCallNode(CORINFO_HELP_DISTRIBUTED_LDELEM_I4, TYP_INT, op1, op2);
+                    impPushOnStack(op1, tiRetVal);
+                    break;
+                }
 
                 // Check for null pointer - in the inliner case we simply abort.
                 if (compIsForInlining() && op1->IsIntegralConst(0))
@@ -7413,6 +7424,13 @@ void Compiler::impImportBlockCode(BasicBlock* block)
                 // Pull the array address.
                 op3 = impPopStack().val;
                 assertImp(op3->TypeIs(TYP_REF));
+
+                if ((info.compMethodInfo->options & CORINFO_OPT_DISTRIBUTED_ACCESS) && lclTyp == TYP_INT)
+                {
+                    op1 = impImplicitIorI4Cast(op1, TYP_I_IMPL);
+                    op1 = gtNewHelperCallNode(CORINFO_HELP_DISTRIBUTED_STELEM_I4, TYP_VOID, op3, op1, op2);
+                    goto SPILL_APPEND;
+                }
 
                 // Mark the block as containing an index expression
                 if (op3->OperIs(GT_LCL_VAR) && op1->OperIs(GT_LCL_VAR, GT_CNS_INT, GT_ADD))

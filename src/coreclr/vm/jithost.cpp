@@ -7,6 +7,9 @@
 #include "corjit.h"
 #include "jithost.h"
 #include "minipal/time.h"
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+#include "distributedadmission.h"
+#endif
 
 void* JitHost::allocateMemory(size_t size)
 {
@@ -39,6 +42,21 @@ int JitHost::getIntConfigValue(const char* name, int defaultValue)
 const char* JitHost::getStringConfigValue(const char* name)
 {
     WRAPPER_NO_CONTRACT;
+
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+    // Keep JIT diagnostics off the managed program's stdout descriptor. This
+    // fixed sink is selected by the runtime, including before entry admission;
+    // no extra environment override or caller-supplied output path is accepted.
+    // jitstdoutInit owns the opened descriptor and freeStringConfigValue owns
+    // this allocation, exactly as for an ordinary string configuration result.
+    if (strcmp(name, "JitStdOutFile") == 0 && DistributedAdmissionIsEnabled())
+    {
+        const char sink[] = "/proc/self/fd/2";
+        char* result = new char[sizeof(sink)];
+        memcpy(result, sink, sizeof(sink));
+        return result;
+    }
+#endif
 
     StackSString str;
     SString(SString::Utf8Literal, name).ConvertToUnicode(str);

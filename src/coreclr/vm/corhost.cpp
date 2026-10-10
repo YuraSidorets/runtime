@@ -9,6 +9,18 @@
 //*****************************************************************************
 
 #include "common.h"
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+#include "distributedadmission.h"
+#include "distributedidentity.h"
+#include "distributedaccess.h"
+#include "distributedthread.h"
+#include "distributedthreadterminal.h"
+#include "peimagelayout.h"
+#include "application_output_custody_v2.h"
+#include "pal_stdout_capture_lease.h"
+#include <new>
+#include <memory>
+#endif
 
 #include "mscoree.h"
 #include "corhost.h"
@@ -64,6 +76,12 @@ STDMETHODIMP CorHost2::Start()
         GC_TRIGGERS;
         ENTRY_POINT;
     }CONTRACTL_END;
+
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+    // Reject startup profilers/hooks and policy overrides before EE startup can load them.
+    if (!DistributedAdmissionCheckEnvironment())
+        return HOST_E_INVALIDOPERATION;
+#endif
 
     HRESULT hr;
 
@@ -255,6 +273,80 @@ static PTRARRAYREF SetCommandLineArgs(PCWSTR pwzAssemblyPath, int argc, PCWSTR* 
     return result;
 }
 
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+// DC-009 stages metadata only. The closed corerun profile has no application
+// AssemblyLoad subscribers before admission; initializer marker tests guard this.
+static bool ValidateDistributedEntry(Assembly* assembly)
+{
+    GCX_COOP();
+    MethodDesc* entry = assembly->GetEntryPoint();
+    if (entry == nullptr || !entry->HasILHeader() || entry->GetAssembly() != assembly)
+        return false;
+
+    mdToken declaringType = mdTokenNil;
+    if (FAILED(entry->GetMDImport()->GetParentToken(entry->GetMemberDef(), &declaringType)) ||
+        TypeFromToken(declaringType) != mdtTypeDef)
+        return false;
+    PCCOR_SIGNATURE signature = nullptr;
+    DWORD signatureSize = 0;
+    entry->GetSig(&signature, &signatureSize);
+    COR_ILMETHOD_DECODER body(entry->GetILHeader());
+    if (body.Code == nullptr)
+        return false;
+
+    bool emptyProbe;
+    {
+        GCX_PREEMP();
+        emptyProbe = DistributedAdmissionIsEmptyProbe();
+    }
+    bool emptyProfileProof = true;
+    if (emptyProbe)
+    {
+        IMDInternalImport* metadata = entry->GetMDImport();
+        MethodTable* type = entry->GetMethodTable();
+        // DC-022 admits one static, non-generic class with no fields or other
+        // executable methods/modules. GetCountWithTokenKind excludes <Module>
+        // only for TypeDef; MethodDef/FieldDef counts include global members.
+        // This proves absence of application work in this terminal probe. It
+        // must not be used to certify obligations for a shared-object profile.
+        emptyProfileProof =
+            metadata->GetCountWithTokenKind(mdtTypeDef) == 1 &&
+            metadata->GetCountWithTokenKind(mdtMethodDef) == 1 &&
+            metadata->GetCountWithTokenKind(mdtFieldDef) == 0 &&
+            metadata->GetCountWithTokenKind(mdtProperty) == 0 &&
+            metadata->GetCountWithTokenKind(mdtEvent) == 0 &&
+            metadata->GetCountWithTokenKind(mdtGenericParam) == 0 &&
+            metadata->GetCountWithTokenKind(mdtFile) == 0 &&
+            metadata->GetCountWithTokenKind(mdtModuleRef) == 0 &&
+            type->IsAbstract() && type->IsSealed() &&
+            type->GetParentMethodTable() == g_pObjectClass &&
+            entry->IsStatic() && entry->IsIL() &&
+            signatureSize == 3 && signature[0] == 0 &&
+            signature[1] == 0 && signature[2] == ELEMENT_TYPE_I4 &&
+            body.GetLocalVarSigTok() == 0 && body.EHCount() == 0 &&
+            body.GetCodeSize() == 2 && body.Code[0] == 0x16 && body.Code[1] == 0x2a;
+    }
+
+    GUID mvid;
+    assembly->GetPEAssembly()->GetMVID(&mvid);
+    PEImageLayout* flat = assembly->GetPEAssembly()->GetPEImage()->GetOrCreateLayout(PEImageLayout::LAYOUT_FLAT);
+    // Metadata/image storage belongs to the non-collectible loaded assembly.
+    // This hashes raw file bytes, never a relocated image or a native address.
+    // File and mapping checks must not block a cooperative GC participant.
+    const mdMethodDef methodToken = entry->GetMemberDef();
+    {
+        GCX_PREEMP();
+        if (!DistributedAdmissionMatchEntry(
+            reinterpret_cast<const unsigned char*>(flat->GetBase()), flat->GetSize(),
+            reinterpret_cast<const unsigned char*>(&mvid),
+            declaringType, methodToken, signature, signatureSize,
+            body.Code, body.GetCodeSize()))
+            return false;
+        return DistributedAdmissionConfirmEntry(emptyProfileProof);
+    }
+}
+#endif
+
 HRESULT CorHost2::ExecuteAssembly(DWORD dwAppDomainId,
                                       LPCWSTR pwzAssemblyPath,
                                       int argc,
@@ -292,6 +384,28 @@ HRESULT CorHost2::ExecuteAssembly(DWORD dwAppDomainId,
     }
 
     HRESULT hr = S_OK;
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+    struct DistributedPalStdoutCapturePin final
+    {
+        PAL_STDOUT_CAPTURE_LEASE lease;
+
+        DistributedPalStdoutCapturePin() : lease{nullptr, -1} {}
+        DistributedPalStdoutCapturePin(const DistributedPalStdoutCapturePin&) = delete;
+        DistributedPalStdoutCapturePin& operator=(const DistributedPalStdoutCapturePin&) = delete;
+        ~DistributedPalStdoutCapturePin() { PALReleaseStdoutCaptureLease(&lease); }
+
+        bool Acquire() { return PALAcquireStdoutCaptureLease(&lease) != FALSE; }
+        int Descriptor() const { return lease.descriptor; }
+    } distributedPalStdoutPin;
+    INT32 distributedMainResult = 0;
+    bool distributedMainReturned = false;
+    bool distributedEmptyProbe = false;
+    DistributedIdentityContext distributedOutputIdentity{};
+    bool distributedOutputIdentityReady = false;
+    std::unique_ptr<DCG01Output::Capture> distributedOutputCapture;
+    DCG01Output::ArtifactInfo distributedOutputArtifact{};
+    char distributedOutputPath[PATH_MAX] = {};
+#endif
 
     AppDomain *pCurDomain = SystemDomain::GetCurrentDomain();
 
@@ -304,6 +418,19 @@ HRESULT CorHost2::ExecuteAssembly(DWORD dwAppDomainId,
             goto ErrExit;
         }
     }
+
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+    if (DistributedAdmissionIsEnabled())
+    {
+        StackSString entryPath(pwzAssemblyPath);
+        if (argc != 0 || DistributedAdmissionPrepare(entryPath.GetUTF8()) != 1)
+        {
+            hr = HOST_E_INVALIDOPERATION;
+            goto ErrExit;
+        }
+        distributedEmptyProbe = DistributedAdmissionIsEmptyProbe();
+    }
+#endif
 
     INSTALL_UNHANDLED_MANAGED_EXCEPTION_TRAP;
     INSTALL_UNWIND_AND_CONTINUE_HANDLER;
@@ -321,10 +448,95 @@ HRESULT CorHost2::ExecuteAssembly(DWORD dwAppDomainId,
 
     Assembly *pAssembly = AssemblySpec::LoadAssembly(pwzAssemblyPath);
 
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+    if (DistributedAdmissionIsEnabled())
+    {
+        if (!ValidateDistributedEntry(pAssembly))
+        {
+            hr = HOST_E_INVALIDOPERATION;
+            goto AdmissionExit;
+        }
+        if (DistributedAdmissionIsIdentityProbe() || DistributedAdmissionIsAccessProbe())
+        {
+            DistributedIdentityContext identity{};
+            if (!DistributedAdmissionIdentityContext(&identity) ||
+                !DistributedIdentityInitialize(pAssembly, identity) ||
+                (DistributedAdmissionIsAccessProbe() && !DistributedAccessInitialize(pAssembly, identity)))
+            {
+                hr = HOST_E_INVALIDOPERATION;
+                goto AdmissionExit;
+            }
+            if (DistributedAdmissionIsThreadProbe())
+            {
+                // IdentityContext is valid only in Matched. Retain its validated
+                // plain-value identity before the barrier advances admission.
+                distributedOutputIdentity = identity;
+                distributedOutputIdentityReady = true;
+            }
+        }
+        // All loader/type-resolution scopes have ended. No CLR lock or managed
+        // access guard is held across this native peer-readiness wait.
+        GCX_PREEMP();
+        const int admission = DistributedAdmissionBarrier();
+        if (admission == 4)
+        {
+            DistributedAccessWorker();
+            hr = HOST_E_INVALIDOPERATION; // No nonempty terminal completion/retirement yet.
+            goto AdmissionExit;
+        }
+        if (admission == 3)
+        {
+            DistributedAdmissionIdentityWorker(DistributedIdentityProcessGraph);
+            hr = HOST_E_INVALIDOPERATION; // DC-010 has no terminal-completion protocol.
+            goto AdmissionExit;
+        }
+        if (admission == 2)
+        {
+            // The empty-probe worker has irrevocably retired; host exit 0 does
+            // not certify global success. Only the coordinator record can.
+            if (pReturnValue) *pReturnValue = 0;
+            goto AdmissionExit;
+        }
+        if (admission != 1)
+        {
+            hr = HOST_E_INVALIDOPERATION;
+            goto AdmissionExit;
+        }
+    }
+#endif
+
 #if defined(FEATURE_MULTICOREJIT)
     pCurDomain->GetMulticoreJitManager().AutoStartProfile(pCurDomain);
 #endif // defined(FEATURE_MULTICOREJIT)
 
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+    if (DistributedAdmissionIsThreadProbe())
+    {
+        const DistributedIdentityContext& outputIdentity = distributedOutputIdentity;
+        const char* artifactBase = std::getenv("DC_EVIDENCE_RECORD");
+        if (artifactBase == nullptr || artifactBase[0] == '\0')
+            artifactBase = std::getenv("DC_ADMISSION_MANIFEST");
+        if (!distributedOutputIdentityReady || outputIdentity.localNode != 1 ||
+            !DCG01Output::BuildArtifactPath(artifactBase, outputIdentity.run, outputIdentity.localNode,
+                                            outputIdentity.localInc, distributedOutputPath,
+                                            sizeof(distributedOutputPath)))
+        {
+            fprintf(stderr, "DC_OUTPUT phase=begin-failed reason=artifact-path\n");
+            hr = HOST_E_INVALIDOPERATION;
+        }
+        else
+        {
+            distributedOutputCapture.reset(new (std::nothrow) DCG01Output::Capture());
+            if (distributedOutputCapture == nullptr)
+            {
+                fprintf(stderr, "DC_OUTPUT phase=begin-failed reason=capture-allocation\n");
+                hr = HOST_E_INVALIDOPERATION;
+            }
+        }
+    }
+#endif
+
+    EX_TRY
     {
         GCX_COOP();
 
@@ -334,10 +546,44 @@ HRESULT CorHost2::ExecuteAssembly(DWORD dwAppDomainId,
         // Here we call the managed method that gets the cmdLineArgs array.
         arguments = SetCommandLineArgs(pwzAssemblyPath, argc, argv);
 
-        if(CLRConfig::GetConfigValue(CLRConfig::INTERNAL_Corhost_Swallow_Uncaught_Exceptions))
+        bool catchMainExceptions = CLRConfig::GetConfigValue(CLRConfig::INTERNAL_Corhost_Swallow_Uncaught_Exceptions) != 0;
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+        // The leaf probe cannot throw from user code. Convert evidence/startup
+        // failures into a controlled host error without entering its Main.
+        catchMainExceptions = catchMainExceptions || distributedEmptyProbe;
+#endif
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+        if (distributedOutputCapture != nullptr && SUCCEEDED(hr))
+        {
+            // Install at the exact host Main boundary, while the argument array
+            // remains protected but no application Main has started. Descriptor
+            // and thread operations run in preemptive mode.
+            GCX_PREEMP();
+            if (!distributedPalStdoutPin.Acquire())
+            {
+                fprintf(stderr, "DC_OUTPUT phase=begin-failed reason=pal-lease\n");
+                hr = HOST_E_INVALIDOPERATION;
+            }
+            else if (!distributedOutputCapture->Begin(distributedPalStdoutPin.Descriptor()))
+            {
+                fprintf(stderr, "DC_OUTPUT phase=begin-failed reason=%s pal-fd=%d\n",
+                        distributedOutputCapture->BeginStage(), distributedPalStdoutPin.Descriptor());
+                hr = HOST_E_INVALIDOPERATION;
+            }
+        }
+#endif
+        if (FAILED(hr))
+        {
+            // Fail closed before entering application Main.
+        }
+        else if (catchMainExceptions)
         {
             EX_TRY
                 DWORD retval = pAssembly->ExecuteMainMethod(&arguments, TRUE /* waitForOtherThreads */);
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+                distributedMainResult = static_cast<INT32>(retval);
+                distributedMainReturned = true;
+#endif
                 if (pReturnValue)
                 {
                     *pReturnValue = retval;
@@ -347,6 +593,10 @@ HRESULT CorHost2::ExecuteAssembly(DWORD dwAppDomainId,
         else
         {
             DWORD retval = pAssembly->ExecuteMainMethod(&arguments, TRUE /* waitForOtherThreads */);
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+            distributedMainResult = static_cast<INT32>(retval);
+            distributedMainReturned = true;
+#endif
             if (pReturnValue)
             {
                 *pReturnValue = retval;
@@ -355,7 +605,86 @@ HRESULT CorHost2::ExecuteAssembly(DWORD dwAppDomainId,
 
         GCPROTECT_END();
     }
+    EX_CATCH
+    {
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+        if (DistributedAdmissionIsThreadProbe())
+        {
+            // This catch is outside GCX_COOP. Cleanup failure must not replace
+            // the original Main exception or turn it into terminal success.
+            EX_TRY
+            {
+                (void)DistributedThreadCloseMainAndDrain();
+            }
+            EX_CATCH
+            {
+                // Preserve the exception being rethrown below.
+            }
+            EX_END_CATCH
+            EX_TRY
+            {
+                DistributedThreadNotifyAbort();
+                DistributedAccessThreadAbort("thread-main-exception");
+            }
+            EX_CATCH
+            {
+                // Keep the original Main exception authoritative.
+            }
+            EX_END_CATCH
+        }
+#endif
+        EX_RETHROW;
+    }
+    EX_END_CATCH
 
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+    if (DistributedAdmissionIsThreadProbe() && !DistributedThreadCloseMainAndDrain())
+        hr = HOST_E_INVALIDOPERATION;
+    if (distributedOutputCapture != nullptr)
+    {
+        bool frozen = distributedOutputCapture->Freeze();
+        bool hasOutput = distributedOutputCapture->CapturedBytes() != 0;
+        bool published = false;
+        if (frozen && hasOutput && distributedMainReturned && SUCCEEDED(hr))
+            published = distributedOutputCapture->Publish(distributedOutputPath, 1, &distributedOutputArtifact);
+        if (published && !DistributedAdmissionIsThreadNegativeProbe() &&
+            !DistributedThreadTerminalArtifact(1, 1, distributedOutputCapture->CapturedData(),
+                distributedOutputCapture->CapturedBytes()))
+            published = false;
+        distributedOutputCapture.reset();
+        if (!frozen || (distributedMainReturned && SUCCEEDED(hr) && (!hasOutput || !published)))
+            hr = HOST_E_INVALIDOPERATION;
+    }
+    if (DistributedAdmissionIsThreadProbe())
+    {
+        if (!distributedMainReturned || FAILED(hr))
+        {
+            DistributedThreadNotifyAbort();
+            DistributedAccessThreadAbort("thread-main-failed");
+            hr = HOST_E_INVALIDOPERATION;
+        }
+        else if (!DistributedAccessThreadFinishApplication(distributedMainResult, &distributedOutputArtifact))
+        {
+            DistributedThreadNotifyAbort();
+            DistributedAccessThreadAbort("thread-main-finish-failed");
+            hr = HOST_E_INVALIDOPERATION;
+        }
+    }
+    if (distributedEmptyProbe)
+    {
+        // ExecuteMainMethod has returned through RunMainPost. No cooperative
+        // scope or loader lock spans terminal transport or record publication.
+        if (!distributedMainReturned || FAILED(hr) ||
+            DistributedAdmissionCompleteMain(distributedMainResult) != 1)
+            hr = HOST_E_INVALIDOPERATION;
+    }
+AdmissionExit:
+    distributedOutputCapture.reset(); // destructor restores descriptors and joins on early failure
+    DistributedAccessShutdown();
+    DistributedAdmissionStop();
+    if (DistributedAdmissionIsThreadProbe() && !DistributedThreadTerminalPersistFailure())
+        hr = HOST_E_INVALIDOPERATION;
+#endif
     UNINSTALL_UNWIND_AND_CONTINUE_HANDLER;
     UNINSTALL_UNHANDLED_MANAGED_EXCEPTION_TRAP;
 
@@ -375,6 +704,10 @@ HRESULT CorHost2::ExecuteInDefaultAppDomain(LPCWSTR pwzAssemblyPath,
                                             LPCWSTR pwzArgument,
                                             DWORD   *pReturnValue)
 {
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+    if (DistributedAdmissionIsEnabled())
+        return HOST_E_INVALIDOPERATION;
+#endif
     CONTRACTL
     {
         NOTHROW;
@@ -472,6 +805,10 @@ HRESULT CorHost2::ExecuteInAppDomain(DWORD dwAppDomainId,
                                      FExecuteInAppDomainCallback pCallback,
                                      void * cookie)
 {
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+    if (DistributedAdmissionIsEnabled())
+        return HOST_E_INVALIDOPERATION;
+#endif
 
     // No point going further if the runtime is not running...
     if (!IsRuntimeActive())
@@ -556,6 +893,21 @@ HRESULT CorHost2::CreateAppDomainWithManager(
 
     if ((wszAppDomainManagerAssemblyName != NULL) || (wszAppDomainManagerTypeName != NULL))
         return E_INVALIDARG;
+
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+    if (DistributedAdmissionIsEnabled())
+    {
+        if (nProperties < 0 || (nProperties > 0 && (!pPropertyNames || !pPropertyValues)))
+            return E_INVALIDARG;
+        for (int i = 0; i < nProperties; ++i)
+        {
+            if (!pPropertyNames[i] || !pPropertyValues[i])
+                return E_INVALIDARG;
+            if (u16_strcmp(pPropertyNames[i], W("STARTUP_HOOKS")) == 0 && pPropertyValues[i][0] != 0)
+                return HOST_E_INVALIDOPERATION;
+        }
+    }
+#endif
 
     BEGIN_EXTERNAL_ENTRYPOINT(&hr);
 
@@ -682,6 +1034,10 @@ HRESULT CorHost2::CreateDelegate(
     LPCWSTR wszMethodName,
     INT_PTR* fnPtr)
 {
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+    if (DistributedAdmissionIsEnabled())
+        return HOST_E_INVALIDOPERATION;
+#endif
 
     CONTRACTL
     {

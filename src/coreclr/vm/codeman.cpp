@@ -6,6 +6,9 @@
 //
 
 #include "common.h"
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+#include "distributedadmission.h"
+#endif
 #include "jitinterface.h"
 #include "corjit.h"
 #include "jithost.h"
@@ -1940,6 +1943,16 @@ static void LoadAndInitializeJIT(LPCWSTR pwzJitName DEBUGARG(LPCWSTR pwzJitPath)
     {
         pJitLoadData->jld_status = JIT_LOAD_STATUS_DONE_LOAD;
 
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+        // A JIT may load after admission's initial mapping snapshot. Verify the
+        // mapped artifact before calling into that compiler.
+        if (!DistributedAdmissionCheckCompiler(reinterpret_cast<const void*>(GetProcAddress(*phJit, "getJit"))))
+        {
+            pJitLoadData->jld_hr = E_FAIL;
+            LogJITInitializationError("DC-009 rejected the loaded compiler artifact");
+            return;
+        }
+#endif
         EX_TRY
         {
             typedef void (* pjitStartup)(ICorJitHost*);

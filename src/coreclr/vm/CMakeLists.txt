@@ -2,6 +2,14 @@ set(CMAKE_INCLUDE_CURRENT_DIR ON)
 
 set(RUNTIME_DIR ../runtime)
 
+# DC-008: native Linux x64 control transport, deliberately excluded from DAC.
+if(CLR_CMAKE_TARGET_LINUX AND CLR_CMAKE_TARGET_ARCH_AMD64)
+    add_compile_definitions(FEATURE_DISTRIBUTED_CONTROL)
+    find_package(OpenSSL 3.0 REQUIRED)
+    add_library(distributed_control OBJECT distributedcontrol.cpp distributedadmission.cpp distributedevidence.cpp)
+    target_link_libraries(distributed_control PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+endif()
+
 # Needed due to the cmunged files being in the binary folders, the set(CMAKE_INCLUDE_CURRENT_DIR ON) is not enough
 include_directories(BEFORE ${CMAKE_CURRENT_SOURCE_DIR})
 include_directories(${ARCH_SOURCES_DIR})
@@ -388,6 +396,11 @@ if (CLR_CMAKE_TARGET_UNIX AND NOT CLR_CMAKE_TARGET_ARCH_WASM)
     list(APPEND VM_SOURCES_WKS
         ${RUNTIME_DIR}/asyncsafethreadmap.cpp
     )
+endif()
+
+if(CLR_CMAKE_TARGET_LINUX AND CLR_CMAKE_TARGET_ARCH_AMD64)
+    list(APPEND VM_SOURCES_WKS distributedidentity.cpp distributedaccess.cpp
+        distributedthread.cpp distributedthreadprotocol.cpp)
 endif()
 
 # coreclr needs to compile codeman.cpp differently depending on flavor (i.e. dll vs. static lib))

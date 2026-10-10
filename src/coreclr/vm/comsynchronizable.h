@@ -45,6 +45,12 @@ public:
 };
 
 extern "C" void QCALLTYPE ThreadNative_Start(QCall::ThreadHandle thread, int threadStackSize, int priority, BOOL isThreadPool, PCWSTR pThreadName);
+extern "C" BOOL QCALLTYPE ThreadNative_DistributedTryReserveStart(QCall::ObjectHandleOnStack thread);
+extern "C" void QCALLTYPE ThreadNative_DistributedStart(QCall::ObjectHandleOnStack thread, QCall::ObjectHandleOnStack startDelegate);
+extern "C" void QCALLTYPE ThreadNative_DistributedRejectStart();
+extern "C" void QCALLTYPE ThreadNative_DistributedWorkerEnter(QCall::ObjectHandleOnStack thread);
+extern "C" void QCALLTYPE ThreadNative_DistributedCallbackReturned();
+extern "C" void QCALLTYPE ThreadNative_DistributedCallbackFailed();
 extern "C" void QCALLTYPE ThreadNative_SetPriority(QCall::ObjectHandleOnStack thread, INT32 iPriority);
 extern "C" void QCALLTYPE ThreadNative_GetCurrentThread(QCall::ObjectHandleOnStack thread);
 extern "C" BOOL QCALLTYPE ThreadNative_GetIsBackground(QCall::ThreadHandle thread);

@@ -178,6 +178,9 @@ DEFINE_METASIG(SM(Obj_IntPtr_RetIntPtr, j I, I))
 DEFINE_METASIG(SM(VoidPtr_RetVoidPtr, P(v), P(v)))
 DEFINE_METASIG(SM(Obj_VoidPtr_RetVoidPtr, j P(v), P(v)))
 DEFINE_METASIG(SM(Obj_IntPtr_RetObj, j I, j))
+DEFINE_METASIG(SM(Obj_IntPtr_RetInt, j I, i))
+DEFINE_METASIG(SM(Obj_Obj_Int_IntPtr_RetInt, j j i I, i))
+DEFINE_METASIG(SM(Obj_IntPtr_Int_RetVoid, j I i, v))
 DEFINE_METASIG(SM(Obj_RefIntPtr_RetVoid, j r(I), v))
 DEFINE_METASIG(SM(Obj_RefBool_RetVoid, j r(F), v))
 DEFINE_METASIG(SM(Obj_IntPtr_RetVoid, j I, v))
@@ -198,6 +201,8 @@ DEFINE_METASIG_T(SM(ManagedObjectWrapperHolder_RefGuid_RefIntPtr_RetInt, C(MANAG
 #ifdef FEATURE_OBJCMARSHAL
 DEFINE_METASIG_T(SM(Exception_Obj_RefIntPtr_RetVoidPtr, C(EXCEPTION) j r(I), P(v)))
 #endif // FEATURE_OBJCMARSHAL
+DEFINE_METASIG_T(SM(ThreadStart_RetThread, C(THREADSTART), C(THREAD)))
+DEFINE_METASIG_T(SM(Thread_RetVoid, C(THREAD), v))
 DEFINE_METASIG(SM(Int_RetVoid, i, v))
 DEFINE_METASIG(SM(Int_RetObj, i, j))
 DEFINE_METASIG(SM(Int_Int_RetVoid, i i, v))

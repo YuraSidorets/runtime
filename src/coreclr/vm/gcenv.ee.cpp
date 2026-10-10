@@ -25,6 +25,7 @@
 #include "configuration.h"
 #include "genanalysis.h"
 #include "eventpipeadapter.h"
+#include "marshalnative.h"
 
 // Finalizes a weak reference directly.
 extern void FinalizeWeakReference(Object* obj);
@@ -49,11 +50,23 @@ void GCToEEInterface::SuspendEE(SUSPEND_REASON reason)
     ThreadSuspend::SuspendEE((ThreadSuspend::SUSPEND_REASON)reason);
 
     g_pDebugInterface->SuspendForGarbageCollectionCompleted();
+    if (reason == SUSPEND_FOR_GC)
+    {
+        DistributedRuntime_GcProbeAfterSuspendForTest();
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+        DistributedControlAfterSuspend();
+#endif
+    }
 }
 
 void GCToEEInterface::RestartEE(bool bFinishedGC)
 {
     WRAPPER_NO_CONTRACT;
+
+    DistributedRuntime_GcProbeBeforeResumeForTest();
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+    DistributedControlBeforeResume();
+#endif
 
     g_pDebugInterface->ResumeForGarbageCollectionStarted();
 

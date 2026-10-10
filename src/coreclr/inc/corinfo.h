@@ -447,6 +447,13 @@ enum CorInfoHelpFunc
 
     /* Accessing fields */
 
+    CORINFO_HELP_DISTRIBUTED_GETFIELD_I4,
+    CORINFO_HELP_DISTRIBUTED_SETFIELD_I4,
+    CORINFO_HELP_DISTRIBUTED_GETFIELD_REF,
+    CORINFO_HELP_DISTRIBUTED_SETFIELD_REF,
+    CORINFO_HELP_DISTRIBUTED_LDELEM_I4,
+    CORINFO_HELP_DISTRIBUTED_STELEM_I4,
+
     CORINFO_HELP_GETFIELDADDR,
     CORINFO_HELP_GETSTATICFIELDADDR,
     CORINFO_HELP_GETSTATICFIELDADDR_TLS,        // Helper for PE TLS fields
@@ -712,6 +719,7 @@ inline bool callConvIsInstanceMethodCallConv(CorInfoCallConvExtension callConv)
 // These are returned from getMethodOptions
 enum CorInfoOptions
 {
+    CORINFO_OPT_DISTRIBUTED_ACCESS          = 0x00000001, // exact admitted DC-011 method only
     CORINFO_OPT_INIT_LOCALS                 = 0x00000010, // zero initialize all variables
 
     CORINFO_GENERICS_CTXT_FROM_THIS         = 0x00000020, // is this shared generic code that access the generic context from the this pointer?  If so, then if the method has SEH then the 'this' pointer must always be reported and kept alive.

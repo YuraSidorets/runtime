@@ -1523,6 +1523,17 @@ void HelperCallProperties::init()
 
         switch (helper)
         {
+            // Ordered reads also kill heap value knowledge: another participant may write
+            // while this managed helper waits. Keep default throwing/GC/escape properties.
+            case CORINFO_HELP_DISTRIBUTED_GETFIELD_I4:
+            case CORINFO_HELP_DISTRIBUTED_SETFIELD_I4:
+            case CORINFO_HELP_DISTRIBUTED_GETFIELD_REF:
+            case CORINFO_HELP_DISTRIBUTED_SETFIELD_REF:
+            case CORINFO_HELP_DISTRIBUTED_LDELEM_I4:
+            case CORINFO_HELP_DISTRIBUTED_STELEM_I4:
+                mutatesHeap = true;
+                break;
+
             // Arithmetic helpers that cannot throw
             case CORINFO_HELP_LLSH:
             case CORINFO_HELP_LRSH:

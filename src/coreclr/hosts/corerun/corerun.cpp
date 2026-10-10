@@ -190,7 +190,7 @@ public:
     , _argv{ argv }
     { }
 
-    void dump_details(FILE* fd = stdout)
+    void dump_details(FILE* fd = stderr)
     {
         // Using std::fprintf since values have been converted to UTF-8.
         std::fprintf(fd, "Exe path: %s\n", _exePath);

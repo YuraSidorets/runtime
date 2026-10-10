@@ -38,6 +38,23 @@ public:
 };
 
 extern "C" SIZE_T QCALLTYPE MarshalNative_OffsetOf(FieldDesc* pFD);
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+extern "C" INT64 QCALLTYPE DistributedRuntime_ControlForTest(INT32 command, INT32 argument, BYTE* buffer, INT32 length);
+extern "C" INT32 QCALLTYPE DistributedRuntime_IdentityExportForTest(BYTE* buffer, INT32 capacity, QCall::ObjectHandleOnStack root);
+extern "C" INT32 QCALLTYPE DistributedRuntime_IdentityImportForTest(BYTE* wire, INT32 len, QCall::ObjectHandleOnStack result);
+extern "C" INT32 QCALLTYPE DistributedRuntime_AccessReadInt32(QCall::ObjectHandleOnStack target, INT_PTR location, INT32 kind);
+extern "C" void QCALLTYPE DistributedRuntime_AccessWriteInt32(QCall::ObjectHandleOnStack target, INT_PTR location, INT32 kind, INT32 value);
+extern "C" void QCALLTYPE DistributedRuntime_AccessReadReference(QCall::ObjectHandleOnStack target, INT_PTR field, QCall::ObjectHandleOnStack result);
+extern "C" void QCALLTYPE DistributedRuntime_AccessWriteReference(QCall::ObjectHandleOnStack target, INT_PTR field, QCall::ObjectHandleOnStack value);
+extern "C" void QCALLTYPE DistributedRuntime_AccessStartForTest(QCall::ObjectHandleOnStack root, QCall::ObjectHandleOnStack array, INT32 testCase);
+extern "C" void QCALLTYPE DistributedRuntime_AccessFinishForTest(INT32 coordinatorResult, QCall::ObjectHandleOnStack artifact);
+extern "C" void DistributedControlAfterSuspend();
+extern "C" void DistributedControlBeforeResume();
+#endif
+extern "C" INT32 QCALLTYPE DistributedRuntime_StartGcProgressProbeForTest();
+extern "C" UINT64 QCALLTYPE DistributedRuntime_StopGcProgressProbeForTest();
+extern "C" void DistributedRuntime_GcProbeAfterSuspendForTest();
+extern "C" void DistributedRuntime_GcProbeBeforeResumeForTest();
 
 extern "C" VOID QCALLTYPE MarshalNative_Prelink(MethodDesc * pMD);
 extern "C" BOOL QCALLTYPE MarshalNative_IsBuiltInComSupported();
@@ -57,6 +74,7 @@ extern "C" int32_t QCALLTYPE MarshalNative_GetHRForException(QCall::ObjectHandle
 #endif // FEATURE_COMINTEROP
 
 extern "C" OBJECTHANDLE QCALLTYPE GCHandle_InternalAllocWithGCTransition(QCall::ObjectHandleOnStack obj, int type);
+extern "C" UINT_PTR QCALLTYPE DistributedRuntime_GetAddressForTest(QCall::ObjectHandleOnStack obj);
 extern "C" void QCALLTYPE GCHandle_InternalFreeWithGCTransition(OBJECTHANDLE handle);
 #ifdef FEATURE_JAVAMARSHAL
 extern "C" void QCALLTYPE GCHandle_InternalGetBridgeWait(OBJECTHANDLE handle, QCall::ObjectHandleOnStack result);

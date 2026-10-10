@@ -84,6 +84,109 @@ namespace System.Threading
             return new ThreadHandle(thread);
         }
 
+        private bool TryStartDistributed(bool captureContext, bool parameterizedStart, object? parameter)
+        {
+            Thread self = this;
+            if (DistributedTryReserveStart(ObjectHandleOnStack.Create(ref self)) == Interop.BOOL.FALSE)
+            {
+                return false;
+            }
+
+            bool rejectionReported = false;
+            bool distributedStartAttempted = false;
+            try
+            {
+                StartHelper? helper = _startHelper;
+                if (!captureContext || parameterizedStart || parameter != null ||
+                    helper == null || helper._start is not ThreadStart ||
+                    helper._startArg != null || helper._maxStackSize != 0 ||
+                    helper._culture != null || helper._uiCulture != null ||
+                    helper._executionContext != null ||
+                    _name != null || _priority != (int)ThreadPriority.Normal ||
+                    IsBackground || SynchronizationContext.Current != null ||
+                    CultureInfo.CurrentCulture.Name.Length != 0 ||
+                    CultureInfo.CurrentUICulture.Name.Length != 0 ||
+                    CultureInfo.DefaultThreadCurrentCulture != null ||
+                    CultureInfo.DefaultThreadCurrentUICulture != null)
+                {
+                    rejectionReported = true;
+                    RejectDistributedStart();
+                }
+
+                ExecutionContext? captured = ExecutionContext.Capture();
+                if (captured != null && !captured.IsDefault)
+                {
+                    rejectionReported = true;
+                    RejectDistributedStart();
+                }
+
+                helper._executionContext = captured;
+                Delegate start = helper._start;
+                distributedStartAttempted = true;
+                DistributedStart(ObjectHandleOnStack.Create(ref self), ObjectHandleOnStack.Create(ref start));
+                return true;
+            }
+            catch
+            {
+                // Native DistributedStart owns cleanup once its QCall begins. Before
+                // that point, the current managed Thread still owns a Reserved ticket.
+                if (!rejectionReported && !distributedStartAttempted)
+                {
+                    DistributedRejectStart();
+                }
+                throw;
+            }
+        }
+
+        [System.Diagnostics.CodeAnalysis.DoesNotReturn]
+        private static void RejectDistributedStart()
+        {
+            DistributedRejectStart();
+            throw new InvalidOperationException("Thread start is outside the admitted distributed-thread profile.");
+        }
+
+        private static Thread CreateDistributedWorker(ThreadStart start)
+        {
+            if (SynchronizationContext.Current != null ||
+                CultureInfo.CurrentCulture.Name.Length != 0 ||
+                CultureInfo.CurrentUICulture.Name.Length != 0 ||
+                CultureInfo.DefaultThreadCurrentCulture != null ||
+                CultureInfo.DefaultThreadCurrentUICulture != null)
+            {
+                throw new InvalidOperationException("Worker staging context is not the admitted default context.");
+            }
+
+            Thread worker = new Thread(start);
+            StartHelper helper = worker._startHelper!;
+            helper._startArg = null;
+            helper._executionContext = null;
+            helper._culture = null;
+            helper._uiCulture = null;
+            helper._distributedWorker = true;
+            return worker;
+        }
+
+        private static void RunDistributedWorker(Thread worker)
+        {
+            worker.StartCore();
+            worker.Join();
+        }
+
+        private static void EnterDistributedWorker(Thread worker)
+        {
+            DistributedWorkerEnter(ObjectHandleOnStack.Create(ref worker));
+        }
+
+        private static void NotifyDistributedCallbackReturned()
+        {
+            DistributedCallbackReturned();
+        }
+
+        private static void NotifyDistributedCallbackFailed()
+        {
+            DistributedCallbackFailed();
+        }
+
         private unsafe void StartCore()
         {
             lock (this)
@@ -98,14 +201,70 @@ namespace System.Threading
         [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "ThreadNative_Start")]
         private static unsafe partial void StartInternal(ThreadHandle t, int stackSize, int priority, Interop.BOOL isThreadPool, char* pThreadName);
 
+        [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "ThreadNative_DistributedTryReserveStart")]
+        private static partial Interop.BOOL DistributedTryReserveStart(ObjectHandleOnStack thread);
+
+        [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "ThreadNative_DistributedStart")]
+        private static partial void DistributedStart(ObjectHandleOnStack thread, ObjectHandleOnStack startDelegate);
+
+        [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "ThreadNative_DistributedRejectStart")]
+        private static partial void DistributedRejectStart();
+
+        [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "ThreadNative_DistributedWorkerEnter")]
+        private static partial void DistributedWorkerEnter(ObjectHandleOnStack thread);
+
+        [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "ThreadNative_DistributedCallbackReturned")]
+        private static partial void DistributedCallbackReturned();
+
+        [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "ThreadNative_DistributedCallbackFailed")]
+        private static partial void DistributedCallbackFailed();
+
         // Called from the runtime
         private void StartCallback()
         {
             StartHelper? startHelper = _startHelper;
             Debug.Assert(startHelper != null);
             _startHelper = null;
+            bool distributedCallbackEntered = false;
 
-            startHelper.Run();
+            try
+            {
+                if (startHelper!._distributedWorker)
+                {
+                    EnterDistributedWorker(this);
+                    distributedCallbackEntered = true;
+                }
+
+                startHelper!.Run();
+                if (startHelper._distributedWorker && !startHelper._distributedCallbackFailed)
+                {
+                    NotifyDistributedCallbackReturned();
+                }
+            }
+            catch
+            {
+                if (startHelper!._distributedWorker && !startHelper._distributedCallbackFailed)
+                {
+                    // Includes entry-handshake exceptions before StartHelper.RunWorker's
+                    // application-delegate catch can report failure. Preserve the exception
+                    // already in flight if failure reporting itself also fails.
+                    try
+                    {
+                        NotifyDistributedCallbackFailed();
+                        startHelper._distributedCallbackFailed = true;
+                    }
+                    catch
+                    {
+                    }
+                }
+                if (startHelper!._distributedWorker && !distributedCallbackEntered &&
+                    startHelper._distributedCallbackFailed)
+                {
+                    // The rejected entry has aborted the run. Let staging join and report failure.
+                    return;
+                }
+                throw;
+            }
         }
 
         /// <summary>

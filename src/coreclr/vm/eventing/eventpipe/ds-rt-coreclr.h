@@ -15,6 +15,9 @@
 #include <eventpipe/ds-process-protocol.h>
 #include <eventpipe/ds-profiler-protocol.h>
 #include <eventpipe/ds-dump-protocol.h>
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+#include "distributedadmission.h"
+#endif
 #ifdef FEATURE_PERFMAP
 #include "perfmap.h"
 #endif
@@ -249,6 +252,10 @@ static
 uint32_t
 ds_rt_profiler_attach (DiagnosticsAttachProfilerCommandPayload *payload)
 {
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+    if (DistributedAdmissionIsEnabled())
+        return DS_IPC_E_NOTSUPPORTED;
+#endif
 	STATIC_CONTRACT_NOTHROW;
 
 	if (!g_profControlBlock.fProfControlBlockInitialized)
@@ -278,6 +285,10 @@ static
 uint32_t
 ds_rt_profiler_startup (DiagnosticsStartupProfilerCommandPayload *payload)
 {
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+    if (DistributedAdmissionIsEnabled())
+        return DS_IPC_E_NOTSUPPORTED;
+#endif
 	STATIC_CONTRACT_NOTHROW;
 
 	HRESULT hr = S_OK;
@@ -298,6 +309,10 @@ static
 uint32_t
 ds_rt_set_environment_variable (const ep_char16_t *name, const ep_char16_t *value)
 {
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+    if (DistributedAdmissionIsEnabled())
+        return DS_IPC_E_NOTSUPPORTED;
+#endif
 	return SetEnvironmentVariableW(reinterpret_cast<LPCWSTR>(name), reinterpret_cast<LPCWSTR>(value)) ? S_OK : HRESULT_FROM_WIN32(GetLastError());
 }
 
@@ -345,6 +360,10 @@ static
 uint32_t
 ds_rt_apply_startup_hook (const ep_char16_t *startup_hook_path)
 {
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+    if (DistributedAdmissionIsEnabled())
+        return DS_IPC_E_NOTSUPPORTED;
+#endif
 	if (NULL == startup_hook_path)
 		return DS_IPC_E_INVALIDARG;
 

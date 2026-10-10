@@ -29,6 +29,7 @@
 #include "gcheaputilities.h"
 #include "dbginterface.h"
 #include "marshalnative.h"
+#include "distributedidentity.h"
 #include "fcall.h"
 #include "dllimportcallback.h"
 #include "comdelegate.h"
@@ -47,6 +48,248 @@
 #ifdef FEATURE_JAVAMARSHAL
 #include "interoplibinterface.h"
 #endif // FEATURE_JAVAMARSHAL
+
+#include <atomic>
+#include <cstdint>
+
+namespace
+{
+// Private DC-006 probe state. A single atomic word arbitrates native worker
+// replies against closing the real EE-suspension window.
+constexpr uint64_t GcProbePhaseMask = 0x3;
+constexpr uint64_t GcProbePhaseClosed = 0;
+constexpr uint64_t GcProbePhaseRequest = 1;
+constexpr uint64_t GcProbePhaseReplied = 2;
+constexpr uint64_t GcProbeMaximumEpoch = (UINT64_MAX >> 2);
+constexpr uint32_t GcProbeCounterMask = 0x000fffff;
+
+
+// Compile-time lock-free guarantees avoid a libatomic fallback in the worker/callback.
+constexpr bool GcProbeAtomicsAreLockFree = ATOMIC_LONG_LOCK_FREE == 2 &&
+    ATOMIC_LLONG_LOCK_FREE == 2 && ATOMIC_INT_LOCK_FREE == 2 && ATOMIC_BOOL_LOCK_FREE == 2;
+std::atomic<uint64_t> s_gcProbeState{0};
+std::atomic<uint64_t> s_gcProbeNextEpoch{0};
+std::atomic<uint32_t> s_gcProbeWindows{0};
+std::atomic<uint32_t> s_gcProbeReplies{0};
+std::atomic<uint32_t> s_gcProbeMisses{0};
+std::atomic<uint32_t> s_gcProbeFailures{0};
+std::atomic<bool> s_gcProbeActive{false};
+HANDLE s_gcProbeThread = INVALID_HANDLE_VALUE;
+// The private fixture serializes Start/Stop on one managed controller thread.
+// This state is intentionally not a general multi-controller lifecycle API.
+
+constexpr uint64_t MakeGcProbeState(uint64_t epoch, uint64_t phase)
+{
+    return (epoch << 2) | phase;
+}
+
+constexpr uint64_t GetGcProbeEpoch(uint64_t state)
+{
+    return state >> 2;
+}
+
+constexpr uint64_t GetGcProbePhase(uint64_t state)
+{
+    return state & GcProbePhaseMask;
+}
+
+DWORD WINAPI DistributedRuntime_GcProgressProbeWorker(LPVOID)
+{
+    while (s_gcProbeActive.load(std::memory_order_acquire))
+    {
+        uint64_t state = s_gcProbeState.load(std::memory_order_acquire);
+        if (GetGcProbePhase(state) == GcProbePhaseRequest)
+        {
+            uint64_t reply = MakeGcProbeState(GetGcProbeEpoch(state), GcProbePhaseReplied);
+            if (s_gcProbeState.compare_exchange_weak(state, reply,
+                    std::memory_order_acq_rel, std::memory_order_acquire))
+            {
+                s_gcProbeReplies.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        else
+        {
+            // Worker is bounded by the fixture's external watchdog and explicit stop.
+            SwitchToThread();
+        }
+    }
+
+    return 0;
+}
+} // namespace
+
+extern "C" void DistributedRuntime_GcProbeAfterSuspendForTest()
+{
+    if (!s_gcProbeActive.load(std::memory_order_acquire))
+        return;
+
+    uint64_t epoch = s_gcProbeNextEpoch.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (epoch == 0 || epoch > GcProbeMaximumEpoch)
+    {
+        s_gcProbeFailures.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
+    uint64_t previous = s_gcProbeState.load(std::memory_order_acquire);
+    if (GetGcProbePhase(previous) != GcProbePhaseClosed ||
+        !s_gcProbeState.compare_exchange_strong(previous,
+            MakeGcProbeState(epoch, GcProbePhaseRequest),
+            std::memory_order_acq_rel, std::memory_order_acquire))
+    {
+        s_gcProbeFailures.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
+    s_gcProbeWindows.fetch_add(1, std::memory_order_relaxed);
+}
+
+extern "C" void DistributedRuntime_GcProbeBeforeResumeForTest()
+{
+    if (!s_gcProbeActive.load(std::memory_order_acquire))
+        return;
+
+    uint64_t previous = s_gcProbeState.load(std::memory_order_acquire);
+    for (int attempt = 0; attempt < 2; attempt++)
+    {
+        if (GetGcProbePhase(previous) == GcProbePhaseClosed)
+            return;
+        uint64_t closed = MakeGcProbeState(GetGcProbeEpoch(previous), GcProbePhaseClosed);
+        if (s_gcProbeState.compare_exchange_strong(previous, closed,
+                std::memory_order_acq_rel, std::memory_order_acquire))
+        {
+            if (GetGcProbePhase(previous) == GcProbePhaseRequest)
+                s_gcProbeMisses.fetch_add(1, std::memory_order_relaxed);
+            else if (GetGcProbePhase(previous) != GcProbePhaseReplied)
+                s_gcProbeFailures.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+
+    s_gcProbeFailures.fetch_add(1, std::memory_order_relaxed);
+}
+
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+extern "C" int DistributedIdentityExportForTest(OBJECTREF root, BYTE* buffer, int capacity);
+extern "C" int DistributedIdentityImportForTest(const BYTE* wire, int len, QCall::ObjectHandleOnStack result);
+extern "C" INT32 QCALLTYPE DistributedRuntime_IdentityExportForTest(BYTE* buffer, INT32 capacity, QCall::ObjectHandleOnStack root)
+{
+    QCALL_CONTRACT;
+    INT32 written = -1;
+    BEGIN_QCALL;
+    GCX_COOP();
+    EX_TRY
+    {
+        written = DistributedIdentityExportForTest(root.Get(), buffer, capacity);
+    }
+    EX_CATCH
+    {
+        written = -1;
+    }
+    EX_END_CATCH
+    END_QCALL;
+    return written;
+}
+extern "C" INT32 QCALLTYPE DistributedRuntime_IdentityImportForTest(BYTE* wire, INT32 len, QCall::ObjectHandleOnStack result)
+{
+    QCALL_CONTRACT;
+    INT32 status = -1;
+    BEGIN_QCALL;
+    GCX_COOP();
+    EX_TRY
+    {
+        status = DistributedIdentityImportForTest(wire, len, result);
+    }
+    EX_CATCH
+    {
+        status = -1;
+    }
+    EX_END_CATCH
+    END_QCALL;
+    return status;
+}
+extern "C" int64_t DistributedControlNative(int command, int argument, unsigned char* buffer, int length);
+extern "C" INT64 QCALLTYPE DistributedRuntime_ControlForTest(INT32 command, INT32 argument, BYTE* buffer, INT32 length)
+{
+    QCALL_CONTRACT;
+    INT64 result = -1;
+    BEGIN_QCALL;
+    result = DistributedControlNative(command, argument, buffer, length);
+    END_QCALL;
+    return result;
+}
+#endif
+
+extern "C" INT32 QCALLTYPE DistributedRuntime_StartGcProgressProbeForTest()
+{
+    QCALL_CONTRACT;
+    INT32 result = 0;
+
+    BEGIN_QCALL;
+    if (!GcProbeAtomicsAreLockFree)
+        result = 3;
+    else if (s_gcProbeThread != INVALID_HANDLE_VALUE || s_gcProbeActive.load(std::memory_order_acquire))
+    {
+        result = 1;
+    }
+    else
+    {
+        s_gcProbeState.store(0, std::memory_order_relaxed);
+        s_gcProbeNextEpoch.store(0, std::memory_order_relaxed);
+        s_gcProbeWindows.store(0, std::memory_order_relaxed);
+        s_gcProbeReplies.store(0, std::memory_order_relaxed);
+        s_gcProbeMisses.store(0, std::memory_order_relaxed);
+        s_gcProbeFailures.store(0, std::memory_order_relaxed);
+        s_gcProbeActive.store(true, std::memory_order_release);
+        s_gcProbeThread = Thread::CreateUtilityThread(Thread::StackSize_Small,
+            DistributedRuntime_GcProgressProbeWorker, nullptr, W("DC006 GC progress probe"));
+        if (s_gcProbeThread == INVALID_HANDLE_VALUE || s_gcProbeThread == nullptr)
+        {
+            s_gcProbeActive.store(false, std::memory_order_release);
+            s_gcProbeThread = INVALID_HANDLE_VALUE;
+            result = 2;
+        }
+    }
+    END_QCALL;
+
+    return result;
+}
+
+extern "C" UINT64 QCALLTYPE DistributedRuntime_StopGcProgressProbeForTest()
+{
+    QCALL_CONTRACT;
+    UINT64 result = UINT64_C(1) << 63;
+
+    BEGIN_QCALL;
+    if (s_gcProbeThread != INVALID_HANDLE_VALUE && s_gcProbeActive.exchange(false, std::memory_order_acq_rel))
+    {
+        DWORD waitResult = WaitForSingleObject(s_gcProbeThread, 10000);
+        if (waitResult == WAIT_OBJECT_0)
+        {
+            CloseHandle(s_gcProbeThread);
+            s_gcProbeThread = INVALID_HANDLE_VALUE;
+            UINT64 windows = s_gcProbeWindows.load(std::memory_order_acquire);
+            UINT64 replies = s_gcProbeReplies.load(std::memory_order_acquire);
+            UINT64 misses = s_gcProbeMisses.load(std::memory_order_acquire);
+            UINT64 failures = s_gcProbeFailures.load(std::memory_order_acquire);
+            uint64_t finalState = s_gcProbeState.load(std::memory_order_acquire);
+            if (windows > GcProbeCounterMask || replies > GcProbeCounterMask || misses > GcProbeCounterMask ||
+                failures != 0 || GetGcProbePhase(finalState) != GcProbePhaseClosed ||
+                windows != replies + misses)
+            {
+                result = UINT64_C(1) << 63;
+            }
+            else
+            {
+                result = (windows << 40) | (misses << 20) | replies;
+            }
+        }
+        // Timeout/failure leaves the handle owned and start permanently rejected;
+        // the fixture process watchdog bounds cleanup. Never detach or restart.
+    }
+    END_QCALL;
+
+    return result;
+}
 
 // Prelink
 // Does advance loading of an PInvoke library
@@ -347,6 +590,22 @@ extern "C" OBJECTHANDLE QCALLTYPE GCHandle_InternalAllocWithGCTransition(QCall::
     END_QCALL;
 
     return hnd;
+}
+
+// Private M01 diagnostic. The returned address stays local and is never serialized.
+extern "C" UINT_PTR QCALLTYPE DistributedRuntime_GetAddressForTest(QCall::ObjectHandleOnStack obj)
+{
+    QCALL_CONTRACT;
+
+    UINT_PTR address = 0;
+    BEGIN_QCALL;
+
+    GCX_COOP();
+    address = reinterpret_cast<UINT_PTR>(OBJECTREFToObject(obj.Get()));
+
+    END_QCALL;
+
+    return address;
 }
 
 FCIMPL2(LPVOID, MarshalNative::GCHandleInternalAlloc, Object *obj, int type)
