@@ -432,11 +432,25 @@ public:
         return accepted;
     }
 
-    bool AccessEvent(unsigned actor, const unsigned char* request, const unsigned char* reply, size_t length, uint64_t before)
+    bool AccessEvent(unsigned actor, const unsigned char* request, const unsigned char* reply, size_t length,
+                    uint64_t before, DCG01Events::AccessDiagnostic* diagnostic = nullptr)
     {
+        if (diagnostic) { *diagnostic = {}; diagnostic->actor = actor; }
         pthread_mutex_lock(&lock);
         const bool accepted = state.configured && !state.failed && state.identity.localNode == 1 &&
-            (request ? (length == 120 && events.CommitAccess(actor, request, reply, before)) : events.ObserveAccess(actor, reply, length));
+            (request ? (length == 120 && events.CommitAccess(actor, request, reply, before, diagnostic)) :
+                events.ObserveAccess(actor, reply, length, diagnostic));
+        if (!accepted && diagnostic)
+        {
+            if (state.configured) diagnostic->node = state.identity.localNode;
+            if (!state.configured) { diagnostic->phase = "terminal"; diagnostic->check = "unconfigured"; }
+            else if (state.failed) { diagnostic->phase = "terminal"; diagnostic->check = "already-failed"; }
+            else if (state.identity.localNode != 1) { diagnostic->phase = "terminal"; diagnostic->check = "wrong-node"; }
+            else if (request && length != 120) { diagnostic->phase = "request-precondition"; diagnostic->check = "request-length"; }
+            else if (!diagnostic->check || !strcmp(diagnostic->check,"none"))
+            { diagnostic->phase = "terminal"; diagnostic->check = "unclassified-rejection"; }
+            events.SnapshotAccessDiagnostic(diagnostic);
+        }
         if (!accepted) LatchLocked(Origin::Evidence,2,"access-event-or-observation");
         pthread_mutex_unlock(&lock);
         return accepted;

@@ -83,12 +83,11 @@ struct ThreadParticipantPreimage
 ThreadParticipantPreimage s_threadParticipantPreimage{};
 std::atomic<bool> s_threadParticipantPreimagePublished{false};
 DCG01Custody::Receiver s_workerCustody{}; // Coordinator Service owns writes, under s_lock.
-std::atomic<bool> s_workerCustodyReceived{false};
+std::atomic<bool> s_workerCustodyReceived{false}; // Exact bytes and worker root cut, not terminal preparation.
 DCG01Custody::Bundle s_workerSentCustody{}; // Worker post-Join owner; never replayed.
 DCG01Commit::Frame s_workerSentCommitment{}; // Written after exact custody ACK and irreversible local commit.
 std::atomic<bool> s_workerCommitmentReceived{false};
 std::atomic<bool> s_coordinatorCommitted{false};
-std::atomic<bool> s_mainReturnObserved{false};
 namespace TP = DistributedThreadProtocol;
 TP::ExpectedIdentity s_threadIdentity{};
 TP::Ledger* s_threadLedger = nullptr; // One bounded run; no reset, takeover or replay.
@@ -660,33 +659,35 @@ bool ThreadCustodyServiceFrame(const BYTE* wire, unsigned length, Clock::time_po
     if (accepted==DCG01Custody::Accepted::Duplicate)
     {
         TraceThreadCustody("received",wire,length,true);
-        return SendUntil(ack,sizeof(ack),23,deadline,true);
+        return !s_coordinatorCommitted.load(std::memory_order_acquire) ||
+            SendUntil(ack,sizeof(ack),23,deadline,true);
     }
     // Exact DCB1 bytes bind the worker's closed, empty logical-root snapshot.
     // Observe that cut only after authenticated custody validation and outside s_lock.
     if (!DistributedThreadTerminalRoots(4, nullptr, 0)) return Abort("thread-worker-root-cut-event");
-    // Physical custody is already owned above. Defer its canonical observation
-    // until Main return; no access/failure lock is held while awaiting that cut.
-    const auto mainDeadline = Clock::now() + std::chrono::seconds(10);
-    while (!s_mainReturnObserved.load(std::memory_order_acquire) && !s_aborted.load() &&
-           Ready() && Clock::now() < mainDeadline) usleep(1000);
-    if (!s_mainReturnObserved.load(std::memory_order_acquire) || s_aborted.load() || !Ready())
-        return Abort("thread-custody-before-main-return");
+    // Main owns terminal preparation and ACK after return; keep Service available meanwhile.
+    TraceThreadCustody("received", wire, length, false);
+    s_workerCustodyReceived.store(true, std::memory_order_release);
+    return true;
+}
+
+bool ThreadPrepareWorkerCustody(BYTE ack[DCG01Custody::AckBytes])
+{
+    DCG01Custody::Bundle custody{};
+    pthread_mutex_lock(&s_lock);
+    const bool valid = s_node == 1 && !s_aborted.load() && !s_shutdown.load() &&
+        s_workerCustodyReceived.load(std::memory_order_acquire) &&
+        s_workerCustody.hasCustody && !s_workerCustody.failed;
+    if (valid) custody = s_workerCustody.received;
+    pthread_mutex_unlock(&s_lock);
+    if (!valid) return Abort("thread-main-worker-custody-state");
+    if (!DCG01Custody::MakeAck(custody, HashThreadCustody, ack))
+        return Abort("thread-main-worker-custody-ack");
+    const BYTE* wire = custody.bytes;
     if (!DistributedThreadTerminalArtifact(3, 2, wire + DCG01Custody::HeaderBytes + U32(wire + 8), U32(wire + 12)))
         return Abort("thread-worker-evidence-custody-event");
     if (!DistributedThreadTerminalPrepared(2, wire + DCG01Custody::HeaderBytes, U32(wire + 8)))
         return Abort("thread-worker-preparation-event");
-    // Exact received bytes are already owned by the coordinator. ACK enqueue is not retirement.
-    TraceThreadCustody("received", wire, length, accepted == DCG01Custody::Accepted::Duplicate);
-    s_workerCustodyReceived.store(true, std::memory_order_release);
-    // Main can now validate both preparations and commit locally. The ACK then
-    // orders that transition before the worker's commitment, without a lock wait.
-    const auto commitDeadline = Clock::now() + std::chrono::seconds(10);
-    while (!s_coordinatorCommitted.load(std::memory_order_acquire) && !s_aborted.load() &&
-           Ready() && Clock::now() < commitDeadline) usleep(1000);
-    if (!s_coordinatorCommitted.load(std::memory_order_acquire) || s_aborted.load() || !Ready())
-        return Abort("thread-custody-before-coordinator-commit");
-    if (!SendUntil(ack, sizeof(ack), 23, deadline)) return false;
     return true;
 }
 
@@ -1407,6 +1408,18 @@ static void TraceThreadRootInventory()
         inventory.retainedCount, inventory.retainedBytes, inventory.length, digest, encoded);
 }
 
+static bool IsPositiveThreadFixture(const BYTE* assemblyHash)
+{
+    const BYTE threadFixtureHash[32] = {
+        0x25,0x8c,0x03,0xf3,0x4d,0x0b,0x34,0x5c,0xa1,0x5e,0x84,0x9f,0xa2,0x33,0xfc,0x3a,
+        0x80,0x0f,0xf7,0x6d,0x40,0xb1,0xca,0x27,0x6f,0x13,0x78,0xd8,0x0d,0x2c,0x01,0x9b };
+    // Audited observation-only delay before Join; not general Thread.Sleep support.
+    const BYTE delayedJoinFixtureHash[32] = {
+        0xc8,0x75,0x30,0x4b,0xeb,0x6c,0xb4,0x5e,0x42,0x30,0x65,0x2a,0xb4,0xf0,0x97,0x15,
+        0x46,0xb2,0xf1,0xdf,0x38,0x25,0xcc,0x9f,0x7c,0x69,0x6c,0xdb,0x48,0xb8,0x39,0xb9 };
+    return Same(assemblyHash, threadFixtureHash, 32) || Same(assemblyHash, delayedJoinFixtureHash, 32);
+}
+
 bool DistributedAccessInitialize(Assembly* assembly, const DistributedIdentityContext& context)
 {
     GCX_COOP();
@@ -1419,9 +1432,7 @@ bool DistributedAccessInitialize(Assembly* assembly, const DistributedIdentityCo
     const BYTE publicationFixtureHash[32] = {
         0x1a,0x7b,0x9b,0x1c,0x3b,0x21,0x6a,0x92,0xfc,0x87,0x15,0x87,0xf9,0xa3,0xfe,0x55,
         0x8d,0x5c,0xe9,0x14,0x8c,0xa5,0xbf,0x9c,0x01,0xe5,0x83,0xfb,0xc5,0x38,0x67,0x13 };
-    const BYTE threadFixtureHash[32] = {
-        0x25,0x8c,0x03,0xf3,0x4d,0x0b,0x34,0x5c,0xa1,0x5e,0x84,0x9f,0xa2,0x33,0xfc,0x3a,
-        0x80,0x0f,0xf7,0x6d,0x40,0xb1,0xca,0x27,0x6f,0x13,0x78,0xd8,0x0d,0x2c,0x01,0x9b };
+    const bool positiveThreadFixtureAllowed = s_threadMode && IsPositiveThreadFixture(context.assemblyHash);
     const BYTE threadNegativeFixtureHashes[4][32] = {
         { 0x61,0xdd,0xcc,0xf5,0x73,0x9f,0x63,0xb9,0xb9,0x98,0x2e,0x17,0xc1,0xa0,0x8c,0xd7,
           0x93,0x16,0xae,0x86,0x17,0x44,0xe3,0x1b,0x8b,0x7c,0xad,0x96,0xf9,0x2d,0xd3,0xc4 },
@@ -1443,14 +1454,13 @@ bool DistributedAccessInitialize(Assembly* assembly, const DistributedIdentityCo
     }
     else
     {
-        const BYTE* expectedFixture = s_threadMode ? threadFixtureHash :
-            DistributedAdmissionIsPublicationProbe() ? publicationFixtureHash : fixtureHash;
-        negativeFixtureAllowed = Same(context.assemblyHash, expectedFixture, 32);
+        const BYTE* expectedFixture = DistributedAdmissionIsPublicationProbe() ? publicationFixtureHash : fixtureHash;
+        negativeFixtureAllowed = s_threadMode ? positiveThreadFixtureAllowed : Same(context.assemblyHash, expectedFixture, 32);
     }
     if (s_module != nullptr || assembly == nullptr || !negativeFixtureAllowed)
         return false;
     s_threadRootProfile = s_threadMode && !DistributedAdmissionIsThreadNegativeProbe() &&
-        Same(context.assemblyHash, threadFixtureHash, 32);
+        positiveThreadFixtureAllowed;
     s_module = assembly->GetModule();
     s_node = context.localNode;
     s_publicationMode = DistributedAdmissionIsPublicationProbe();
@@ -2061,7 +2071,6 @@ bool DistributedAccessThreadFinishApplication(INT32 result, const DCG01Output::A
                 accessSnapshot.lastAcceptedOperationSequence, accessSnapshot.authorityFrontier,
                 accessSnapshot.publicationFrontier))
                 Reject("thread-main-return-event");
-            if (s_threadRootProfile) s_mainReturnObserved.store(true,std::memory_order_release);
             if (s_threadRootProfile && !DistributedThreadTerminalAdmissionClosed(1,
                 accessSnapshot.admissionGeneration, accessSnapshot.lastAcceptedOperationSequence))
                 Reject("thread-main-admission-close-event");
@@ -2096,8 +2105,12 @@ bool DistributedAccessThreadFinishApplication(INT32 result, const DCG01Output::A
                    Ready() && Clock::now() < custodyDeadline) usleep(1000);
             if (!s_workerCustodyReceived.load(std::memory_order_acquire) || s_aborted.load() || !Ready())
                 Reject("thread-main-worker-custody");
+            BYTE custodyAck[DCG01Custody::AckBytes]{};
+            if (!ThreadPrepareWorkerCustody(custodyAck)) Reject("thread-main-worker-custody-preparation");
             if (!DistributedThreadTerminalCommitLocal()) Reject("thread-main-terminal-commitment");
             s_coordinatorCommitted.store(true,std::memory_order_release);
+            if (!SendUntil(custodyAck, sizeof(custodyAck), 23, custodyDeadline))
+                Reject("thread-main-worker-custody-ack-send");
             while (!s_workerCommitmentReceived.load(std::memory_order_acquire) && !s_aborted.load() &&
                    Ready() && Clock::now() < custodyDeadline) usleep(1000);
             if (!s_workerCommitmentReceived.load(std::memory_order_acquire) || s_aborted.load() || !Ready())

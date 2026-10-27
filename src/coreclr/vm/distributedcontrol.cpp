@@ -834,7 +834,14 @@ extern "C" bool DistributedThreadTerminalCopyTrace(unsigned char* output, size_t
 }
 extern "C" bool DistributedThreadTerminalAccess(unsigned actor, const unsigned char* request, const unsigned char* reply, size_t length, uint64_t before)
 {
-    return g_threadTerminal.AccessEvent(actor, request, reply, length, before);
+    DCG01Events::AccessDiagnostic diagnostic{};
+    const bool accepted = g_threadTerminal.AccessEvent(actor, request, reply, length, before, &diagnostic);
+    if (!accepted)
+        fprintf(stderr, "DC_ACCESS_DIAG phase=%s check=%s node=%u actor=%u events=%llu/%llu bytes=%zu/%zu\n",
+            diagnostic.phase, diagnostic.check, diagnostic.node, diagnostic.actor,
+            static_cast<unsigned long long>(diagnostic.events),
+            static_cast<unsigned long long>(diagnostic.eventLimit), diagnostic.used, diagnostic.byteLimit);
+    return accepted;
 }
 
 extern "C" bool DistributedThreadTerminalPublication(unsigned kind, uint64_t id, const unsigned char* root, const unsigned char* objects, unsigned count)

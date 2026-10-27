@@ -590,6 +590,21 @@ HRESULT CorHost2::ExecuteAssembly(DWORD dwAppDomainId,
                 }
             EX_CATCH_HRESULT (hr)
         }
+#ifdef FEATURE_DISTRIBUTED_CONTROL
+        else if (DistributedAdmissionIsThreadProbe())
+        {
+            // Let the native cleanup catch observe Main failures before the
+            // Unix unhandled-exception path terminates the process.
+            DebuggerU2MCatchHandlerFrame catchFrame(true /* catchesAllExceptions */);
+            DWORD retval = pAssembly->ExecuteMainMethod(&arguments, TRUE /* waitForOtherThreads */);
+            distributedMainResult = static_cast<INT32>(retval);
+            distributedMainReturned = true;
+            if (pReturnValue)
+            {
+                *pReturnValue = retval;
+            }
+        }
+#endif
         else
         {
             DWORD retval = pAssembly->ExecuteMainMethod(&arguments, TRUE /* waitForOtherThreads */);
@@ -629,6 +644,20 @@ HRESULT CorHost2::ExecuteAssembly(DWORD dwAppDomainId,
             EX_CATCH
             {
                 // Keep the original Main exception authoritative.
+            }
+            EX_END_CATCH
+            EX_TRY
+            {
+                // AdmissionExit is bypassed by the rethrow. Use its shutdown
+                // order here so failure evidence survives natural termination.
+                distributedOutputCapture.reset();
+                DistributedAccessShutdown();
+                DistributedAdmissionStop();
+                (void)DistributedThreadTerminalPersistFailure();
+            }
+            EX_CATCH
+            {
+                // Evidence failure must not replace the managed exception.
             }
             EX_END_CATCH
         }

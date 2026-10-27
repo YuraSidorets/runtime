@@ -10,6 +10,14 @@
 
 namespace DCG01Events
 {
+struct AccessDiagnostic
+{
+    const char* phase = "terminal";
+    const char* check = "none";
+    unsigned actor = 0, node = 0;
+    uint64_t events = 0, eventLimit = 0;
+    size_t used = 0, byteLimit = 0;
+};
 enum class Lifecycle : unsigned { Admitted = 1, Authorized = 2, Entered = 3, Completed = 4, JoinReturned = 5 };
 enum class Publication : unsigned { Prepared = 1, Acknowledged = 2, Activated = 3, Completed = 4 };
 
@@ -150,10 +158,55 @@ private:
             memcmp(id + 20, identity.memberIncarnations[creator - 1], 16) == 0 &&
             U64(id + 36) >= 1 && U64(id + 36) <= 64;
     }
-    bool EmitAccess(unsigned phase, unsigned actor, const Access& a, uint64_t cause, uint64_t otherCause)
+    static void RejectAccess(AccessDiagnostic* diagnostic, const char* phase, const char* check)
     {
+        if (diagnostic) { diagnostic->phase = phase; diagnostic->check = check; }
+    }
+    const char* CommitAccessPrecondition(unsigned actor, const unsigned char* request,
+                                         const unsigned char* reply, uint64_t before) const
+    {
+        if (!used) return "not-started";
+        if (actor < 1 || actor > 2) return "actor-range";
+        if (!request) return "request-null";
+        if (!reply) return "reply-null";
+        if (stage < 2) return "stage-before-authorized";
+        if (actor == 2 && stage != 3) return "worker-stage";
+        if (actor == 1 && mainReturnEvent) return "main-returned";
+        if (admissionClosed[actor - 1]) return "admission-closed";
+        if (pending[actor - 1].active) return "operation-pending";
+        if (memcmp(request, "DAO1", 4)) return "request-magic";
+        if (U32(request + 4) != 1) return "request-version";
+        if (memcmp(reply, "DAP1", 4)) return "reply-magic";
+        if (U32(reply + 4) != 1) return "reply-version";
+        if (U64(request + 8) != nextOperation[actor - 1]) return "operation-sequence";
+        if (U64(reply + 8) != U64(request + 8)) return "reply-operation-sequence";
+        if (U64(reply + 16) != lastAuthority + 1) return "authority-sequence";
+        if (before != observedFrontier[actor - 1]) return "observed-frontier";
+        if (before >= U64(reply + 16)) return "authority-not-advanced";
+        if (U32(request + 16) > 5) return "operation-kind";
+        if (U32(reply + 24) != U32(request + 16)) return "reply-operation-kind";
+        if (U32(reply + 28) != U32(request + 20)) return "reply-slot";
+        if (memcmp(request + 24, reply + 32, 44)) return "reply-object";
+        if (!Logical(request + 24, false)) return "object-identity";
+        const unsigned operation = U32(request + 16);
+        if (actor == 1 && publicationStage && (publicationStage != 3 || publicationStoreAuthority ||
+            operation != 3 || memcmp(request + 68, publicationRoot, 44))) return "publication-store";
+        const bool reference = operation == 2 || operation == 3;
+        if (reference && (!Logical(request + 68, true) || !Logical(reply + 76, true))) return "reference-identity";
+        for (unsigned i = (operation & 1) ? (reference ? 44 : 4) : 0; i != 44; ++i)
+            if (request[68 + i]) return "request-value-padding";
+        if (!reference) for (unsigned i = 4; i != 44; ++i)
+            if (reply[76 + i]) return "reply-value-padding";
+        if ((operation & 1) && memcmp(request + 68, reply + 76, 44)) return "write-value";
+        return nullptr;
+    }
+    bool EmitAccess(unsigned phase, unsigned actor, const Access& a, uint64_t cause, uint64_t otherCause,
+                    AccessDiagnostic* diagnostic)
+    {
+        const char* phaseName = phase == 0 ? "request-event" : phase == 1 ? "commit-event" : "observation-event";
         const unsigned member = phase == 1 ? 1 : actor;
-        if (events >= MaxEvents || cause > events || otherCause > events) return false;
+        if (events >= MaxEvents) { RejectAccess(diagnostic, phaseName, "event-capacity"); return false; }
+        if (cause > events || otherCause > events) { RejectAccess(diagnostic, phaseName, "causal-bound"); return false; }
         unsigned char record[2048]{};
         DC022Canonical::Writer w(record, sizeof(record));
         const unsigned operation = U32(a.request + 16);
@@ -188,7 +241,8 @@ private:
         }
         ok = ok && w.EndObject() && w.Key("record") && w.String("event") &&
             w.Key("trace_seq") && w.UInt(events + 1) && w.EndObject() && w.Finish();
-        if (!ok || w.Size() > MaxBytes - used) return false;
+        if (!ok) { RejectAccess(diagnostic, phaseName, "encoding"); return false; }
+        if (w.Size() > MaxBytes - used) { RejectAccess(diagnostic, phaseName, "byte-capacity"); return false; }
         memcpy(bytes + used, w.Data(), w.Size()); used += w.Size(); ++events; ++memberEvents[member - 1];
         return true;
     }
@@ -256,6 +310,12 @@ private:
         return true;
     }
 public:
+    void SnapshotAccessDiagnostic(AccessDiagnostic* diagnostic) const
+    {
+        if (!diagnostic) return;
+        diagnostic->events = events; diagnostic->eventLimit = MaxEvents;
+        diagnostic->used = used; diagnostic->byteLimit = MaxBytes;
+    }
     bool Configure(const DistributedAdmissionThreadIdentity& id)
     {
         if (used || id.localNode != 1) return false;
@@ -304,7 +364,8 @@ public:
         return false;
     }
 
-    bool CommitAccess(unsigned actor, const unsigned char* request, const unsigned char* reply, uint64_t before)
+    bool CommitAccess(unsigned actor, const unsigned char* request, const unsigned char* reply, uint64_t before,
+                      AccessDiagnostic* diagnostic = nullptr)
     {
         if (!used || actor < 1 || actor > 2 || !request || !reply || stage < 2 ||
             (actor == 2 && stage != 3) || (actor == 1 && mainReturnEvent) || admissionClosed[actor - 1] || pending[actor - 1].active ||
@@ -314,35 +375,51 @@ public:
             U64(reply + 16) != lastAuthority + 1 || before != observedFrontier[actor - 1] ||
             before >= U64(reply + 16) || U32(request + 16) > 5 ||
             U32(reply + 24) != U32(request + 16) || U32(reply + 28) != U32(request + 20) ||
-            memcmp(request + 24, reply + 32, 44) || !Logical(request + 24, false)) return false;
+            memcmp(request + 24, reply + 32, 44) || !Logical(request + 24, false))
+        {
+            RejectAccess(diagnostic, "commit-precondition", CommitAccessPrecondition(actor, request, reply, before));
+            return false;
+        }
         const unsigned operation = U32(request + 16);
         if (actor == 1 && publicationStage && (publicationStage != 3 || publicationStoreAuthority ||
-            operation != 3 || memcmp(request + 68, publicationRoot, 44))) return false;
+            operation != 3 || memcmp(request + 68, publicationRoot, 44)))
+        { RejectAccess(diagnostic, "commit-precondition", "publication-store"); return false; }
         const bool reference = operation == 2 || operation == 3;
-        if (reference && (!Logical(request + 68, true) || !Logical(reply + 76, true))) return false;
+        if (reference && (!Logical(request + 68, true) || !Logical(reply + 76, true)))
+        { RejectAccess(diagnostic, "commit-precondition", "reference-identity"); return false; }
         for (unsigned i = (operation & 1) ? (reference ? 44 : 4) : 0; i != 44; ++i)
-            if (request[68 + i]) return false;
-        if (!reference) for (unsigned i = 4; i != 44; ++i) if (reply[76 + i]) return false;
-        if ((operation & 1) && memcmp(request + 68, reply + 76, 44)) return false;
+            if (request[68 + i]) { RejectAccess(diagnostic, "commit-precondition", "request-value-padding"); return false; }
+        if (!reference) for (unsigned i = 4; i != 44; ++i)
+            if (reply[76 + i]) { RejectAccess(diagnostic, "commit-precondition", "reply-value-padding"); return false; }
+        if ((operation & 1) && memcmp(request + 68, reply + 76, 44))
+        { RejectAccess(diagnostic, "commit-precondition", "write-value"); return false; }
         Access a{}; a.active = true; a.before = before;
         memcpy(a.request, request, 112); memcpy(a.reply, reply, 120);
         const uint64_t cause = ActorCause(actor);
-        if (!EmitAccess(0, actor, a, cause, 0)) return false;
+        if (!EmitAccess(0, actor, a, cause, 0, diagnostic)) return false;
         const uint64_t requested = events;
-        if (!EmitAccess(1, actor, a, requested, lastCommitEvent)) return false;
+        if (!EmitAccess(1, actor, a, requested, lastCommitEvent, diagnostic)) return false;
         a.commitEvent = events; pending[actor - 1] = a;
         lastCommitEvent = events; lastAuthority = U64(reply + 16); ++nextOperation[actor - 1];
         if (actor == 1 && publicationStage == 3) publicationStoreAuthority = lastAuthority;
         return true;
     }
 
-    bool ObserveAccess(unsigned actor, const unsigned char* reply, size_t length)
+    bool ObserveAccess(unsigned actor, const unsigned char* reply, size_t length, AccessDiagnostic* diagnostic = nullptr)
     {
-        if (actor < 1 || actor > 2 || !reply || length != 120 || !used) return false;
+        if (actor < 1 || actor > 2 || !reply || length != 120 || !used)
+        {
+            const char* check = actor < 1 || actor > 2 ? "actor-range" : !reply ? "reply-null" :
+                length != 120 ? "reply-length" : "not-started";
+            RejectAccess(diagnostic, "observation-precondition", check);
+            return false;
+        }
         const unsigned index = actor - 1;
         if (observedEvent[index] && memcmp(lastObservedReply[index], reply, 120) == 0) return true;
         Access& a = pending[index];
-        if (!a.active || memcmp(a.reply, reply, 120) || !EmitAccess(2, actor, a, a.commitEvent, publicationEvent[index])) return false;
+        if (!a.active) { RejectAccess(diagnostic, "observation-precondition", "no-pending-operation"); return false; }
+        if (memcmp(a.reply, reply, 120)) { RejectAccess(diagnostic, "observation-precondition", "reply-mismatch"); return false; }
+        if (!EmitAccess(2, actor, a, a.commitEvent, publicationEvent[index], diagnostic)) return false;
         observedFrontier[index] = U64(reply + 16); observedEvent[index] = events;
         memcpy(lastObservedReply[index], reply, 120); a.active = false;
         return true;
