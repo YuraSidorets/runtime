@@ -65,6 +65,9 @@ bool journalPersistenceClaimed = false; // Protected by lifecycleLock; no run re
 Item tx[DataSlots]{}, rx[DataSlots]{};
 unsigned txHead = 0, txCount = 0, rxHead = 0, rxCount = 0;
 uint64_t consumed = 0;
+#ifdef DCG01_TEST_HOOKS
+std::atomic<bool> g_testT04CommitmentDequeued{false};
+#endif
 
 uint64_t now()
 {
@@ -500,6 +503,10 @@ void exchange(SSL* ssl, int fd)
                 {
                     unsigned kind = get(input + 6, 2);
                     uint64_t sequence = get(input + 24, 8), correlation = get(input + 120, 8);
+#ifdef DCG01_TEST_HOOKS
+                    const bool testT04Commitment = DCG01Terminal::TestT033Case("t04-late-dcm1") && kind == 22 &&
+                        inputTarget >= Header + 4 && memcmp(input + Header, "DCM1", 4) == 0;
+#endif
                     if (kind >= 16)
                     {
                         unsigned char digest[SHA256_DIGEST_LENGTH];
@@ -531,6 +538,13 @@ void exchange(SSL* ssl, int fd)
                             memcpy(digests[sequence % DataSlots], digest, sizeof(digest));
                             received = sequence; stats[3].fetch_add(1);
                              if (!captureFrame(dcg01_raw::Inbound, dcg01_raw::ReceiveMark::NewFrame, input, inputTarget)) break;
+#ifdef DCG01_TEST_HOOKS
+                            if (testT04Commitment)
+                            {
+                                while (!g_testT04CommitmentDequeued.load(std::memory_order_acquire) &&
+                                       !stop.load() && !abortRequested.load()) usleep(1000);
+                            }
+#endif
                         }
                     }
                     else
@@ -1063,6 +1077,13 @@ extern "C" void DistributedControlAfterSuspend()
     }
 }
 extern "C" void DistributedControlBeforeResume() { gcWindow.store(0); }
+
+#ifdef DCG01_TEST_HOOKS
+extern "C" void DistributedControlTestT04CommitmentDequeued()
+{
+    g_testT04CommitmentDequeued.store(true, std::memory_order_release);
+}
+#endif
 
 extern "C" bool DistributedControlFrameJournalSnapshot(dcg01_raw::SessionContext* session,
     dcg01_raw::FrameMeta* rows, size_t rowCapacity, unsigned char* frameBytes,

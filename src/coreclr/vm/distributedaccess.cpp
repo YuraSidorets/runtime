@@ -22,10 +22,14 @@
 #include <cstdio>
 #include <cstring>
 #include <pthread.h>
+#include <signal.h>
 #include <unistd.h>
 #include <openssl/sha.h>
 
 extern "C" int64_t DistributedControlNative(int command, int argument, BYTE* buffer, int length);
+#ifdef DCG01_TEST_HOOKS
+extern "C" void DistributedControlTestT04CommitmentDequeued();
+#endif
 extern "C" int DistributedIdentityExportForTest(OBJECTREF root, BYTE* buffer, int capacity);
 
 namespace
@@ -565,6 +569,13 @@ bool ThreadServiceFrame(const BYTE* wire, unsigned length, Clock::time_point dea
     }
     if (completed)
     {
+#ifdef DCG01_TEST_HOOKS
+        if (s_threadRootProfile && DCG01Terminal::TestT033Case("t08-premature-retirement"))
+        {
+            if (DistributedThreadTerminalRetireWorker()) return Abort("t033-premature-retirement-unexpectedly-accepted");
+            return Abort("t033-premature-retirement-guard-rejected");
+        }
+#endif
         s_workerResult = 0;
         s_workerDone.store(true, std::memory_order_release);
         DistributedThreadNotifyComplete();
@@ -736,6 +747,14 @@ bool ThreadConsumeCustodyAck(const BYTE* wire, unsigned length)
 
 bool ThreadCommitmentServiceFrame(const BYTE* wire, unsigned length)
 {
+#ifdef DCG01_TEST_HOOKS
+    if (DCG01Terminal::TestT033Case("t04-late-dcm1"))
+    {
+        // The transport receiver waits for this dequeue before reading the following abort frame.
+        DistributedControlTestT04CommitmentDequeued();
+        while (DistributedThreadTerminalHealthy() && !s_aborted.load() && !s_shutdown.load()) usleep(1000);
+    }
+#endif
     DCG01Custody::Bundle custody{};
     pthread_mutex_lock(&s_lock);
     const bool valid = s_node == 1 && !s_aborted.load() && !s_shutdown.load() &&
@@ -1417,7 +1436,12 @@ static bool IsPositiveThreadFixture(const BYTE* assemblyHash)
     const BYTE delayedJoinFixtureHash[32] = {
         0xc8,0x75,0x30,0x4b,0xeb,0x6c,0xb4,0x5e,0x42,0x30,0x65,0x2a,0xb4,0xf0,0x97,0x15,
         0x46,0xb2,0xf1,0xdf,0x38,0x25,0xcc,0x9f,0x7c,0x69,0x6c,0xdb,0x48,0xb8,0x39,0xb9 };
-    return Same(assemblyHash, threadFixtureHash, 32) || Same(assemblyHash, delayedJoinFixtureHash, 32);
+    const BYTE singleReadFixtureHash[32] = {
+        0x08,0x0b,0x39,0x08,0xa2,0xe6,0x26,0x98,0xe2,0x0c,0xb3,0xb9,0x48,0xfc,0x71,0x02,
+        0x35,0x76,0x28,0x17,0x0d,0x3c,0xb3,0xe3,0x2a,0x76,0x8e,0xbc,0x91,0x95,0x3e,0xc0 };
+    return Same(assemblyHash, threadFixtureHash, 32) ||
+        Same(assemblyHash, delayedJoinFixtureHash, 32) ||
+        Same(assemblyHash, singleReadFixtureHash, 32);
 }
 
 bool DistributedAccessInitialize(Assembly* assembly, const DistributedIdentityContext& context)
@@ -2051,6 +2075,9 @@ bool DistributedAccessThreadFinishApplication(INT32 result, const DCG01Output::A
 {
     bool success = false;
     bool recordPublished = false;
+#ifdef DCG01_TEST_HOOKS
+    bool t10KillAfterDiagnostics = false;
+#endif
     EX_TRY
     {
         if (!s_threadMode || s_node != 1 || !s_open.load() || s_finished.load() ||
@@ -2137,6 +2164,19 @@ bool DistributedAccessThreadFinishApplication(INT32 result, const DCG01Output::A
                 Reject("thread-main-retirement-cut");
             if (!DistributedThreadTerminalRetireWorker()) Reject("thread-main-worker-retirement");
             if (!DistributedThreadTerminalPrepareDrain()) Reject("thread-main-seal-and-drain");
+#ifdef DCG01_TEST_HOOKS
+            if (DCG01Terminal::TestT033Case("t05-postseal-disconnect"))
+            {
+                if (DistributedThreadTerminalPeerDisconnected()) Reject("t033-peer-disconnect-preceded-barrier");
+                if (std::fprintf(stderr,"DC_THREAD phase=t033-postseal-barrier\n") < 0 || fflush(stderr) != 0)
+                    Reject("t033-postseal-barrier-marker-write");
+                else
+                {
+                    while (!DistributedThreadTerminalPeerDisconnected() && !s_aborted.load() && !s_shutdown.load()) usleep(1000);
+                    if (!DistributedThreadTerminalPeerDisconnected()) Reject("t033-postseal-disconnect-not-observed");
+                }
+            }
+#endif
             // Retirement discharged application obligations. Stop the sole producer,
             // then let the service validate its queue before any record publication.
             if (DistributedControlNative(4,0,nullptr,0)!=0) Reject("thread-main-transport-stop");
@@ -2145,9 +2185,19 @@ bool DistributedAccessThreadFinishApplication(INT32 result, const DCG01Output::A
             if(s_aborted.load() || !DistributedThreadTerminalHealthy() ||
                 DistributedControlNative(3,0,nullptr,0)!=4 || DistributedControlNative(3,12,nullptr,0)!=0 ||
                 DistributedControlNative(3,9,nullptr,0)!=0) Reject("thread-main-terminal-drain");
-            if(DistributedThreadTerminalPublishRecord()==DCG01Terminal::PublicationResult::Failed)
+            const auto recordPublication = DistributedThreadTerminalPublishRecord();
+            if(recordPublication==DCG01Terminal::PublicationResult::Failed)
                 Reject("thread-main-terminal-publication");
             recordPublished=true;
+#ifdef DCG01_TEST_HOOKS
+            if (DCG01Terminal::TestT033Case("t10-record-kill"))
+            {
+                if (recordPublication != DCG01Terminal::PublicationResult::Complete)
+                    Reject("t033-record-export-incomplete");
+                else
+                    t10KillAfterDiagnostics = true;
+            }
+#endif
             NewArrayHolder<BYTE> lifecycle(new BYTE[DCG01Events::Stream::MaxBytes]);
             size_t lifecycleBytes = 0;
             uint64_t lifecycleCount = 0;
@@ -2181,6 +2231,17 @@ bool DistributedAccessThreadFinishApplication(INT32 result, const DCG01Output::A
         encoded[length * 2] = 0;
         std::fprintf(stderr, "DC_THREAD phase=access-history status=%s bytes=%u hex=%s\n",
             success ? "LOCAL_EXPERIMENT" : "ABORTED", length, static_cast<char*>(encoded));
+#ifdef DCG01_TEST_HOOKS
+        if (t10KillAfterDiagnostics)
+        {
+            if (fflush(stderr) != 0)
+            {
+                Reject("t033-diagnostic-flush");
+                t10KillAfterDiagnostics = false;
+            }
+            if (t10KillAfterDiagnostics && kill(getpid(), SIGKILL) != 0) _exit(127);
+        }
+#endif
     }
     EX_CATCH
     {

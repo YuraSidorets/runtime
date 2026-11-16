@@ -4,11 +4,24 @@
 #define DISTRIBUTED_TERMINAL_EVIDENCE_H
 #include "distributedthreadterminal.h"
 #include "raw_frame_custody_path.h"
+#include <atomic>
 #include <memory>
 #include <new>
 
 namespace DCG01TerminalFiles
 {
+#ifdef DCG01_TEST_HOOKS
+struct T033FailMainRecordWriteOnce : DCG01Record::System
+{
+    static ssize_t Write(int fd,const void* bytes,size_t length)
+    {
+        static std::atomic<bool> injected{false};
+        if(DCG01Terminal::TestT033Case("t09-record-write-failure") && !injected.exchange(true,std::memory_order_acq_rel))
+        {errno=EIO;return -1;}
+        return DCG01Record::System::Write(fd,bytes,length);
+    }
+};
+#endif
 inline bool Matches(const DistributedAdmissionThreadIdentity& id,const DistributedAdmissionJournalContext& context)
 {
     return (id.localNode==1 || id.localNode==2) && context.localNode==id.localNode && context.peerNode==3-id.localNode &&
@@ -56,9 +69,36 @@ inline DCG01Terminal::PublicationResult Publish(DCG01Terminal::FailureOrder& ord
     int directory=dcg01_raw::custody::OpenAdmittedManifestDirectory(context.manifestPath,context.manifestSha256);
     char name[DCG01Record::NameBytes]{};DCG01Record::Witness record{};
     if(directory<0){record.failure=DCG01Record::Failure::Create;record.errorNumber=errno;}
+#ifdef DCG01_TEST_HOOKS
+    else if(Name(state.identity,"record",name,sizeof(name)) && DCG01Terminal::TestT033Case("t09-record-write-failure"))
+        record=DCG01Record::Store<T033FailMainRecordWriteOnce>(directory,name,seal->record,seal->recordBytes);
+#endif
     else if(Name(state.identity,"record",name,sizeof(name))) record=DCG01Record::Store(directory,name,seal->record,seal->recordBytes);
+#ifdef DCG01_TEST_HOOKS
+    bool testDiagnosticOkay=true;
+    if(DCG01Terminal::TestT033Case("t09-record-write-failure"))
+    {
+        char runHex[33]{},incHex[33]{},digestHex[65]{};
+        const char digits[]="0123456789abcdef";
+        for(size_t i=0;i<16;++i){runHex[i*2]=digits[context.run[i]>>4];runHex[i*2+1]=digits[context.run[i]&15];
+            incHex[i*2]=digits[context.localIncarnation[i]>>4];incHex[i*2+1]=digits[context.localIncarnation[i]&15];}
+        for(size_t i=0;i<32;++i){digestHex[i*2]=digits[record.digest[i]>>4];digestHex[i*2+1]=digits[record.digest[i]&15];}
+        const char* failure=record.failure==DCG01Record::Failure::Write?"Write":
+            record.failure==DCG01Record::Failure::Create?"Create":record.failure==DCG01Record::Failure::Flush?"Flush":
+            record.failure==DCG01Record::Failure::AtomicPublish?"AtomicPublish":
+            record.failure==DCG01Record::Failure::Readback?"Readback":"Unknown";
+        testDiagnosticOkay=fprintf(stderr,
+            "DC_THREAD phase=t033-record-write-witness case=t09-record-write-failure run_id=%s incarnation_id=%s failure=%s error_number=%d written=%zu length=%zu file_flushed=%u renamed=%u directory_flushed=%u readback_matched=%u sha256=%s\n",
+            runHex,incHex,failure,record.errorNumber,record.written,record.length,record.fileFlushed?1u:0u,
+            record.renamed?1u:0u,record.directoryFlushed?1u:0u,record.readbackMatched?1u:0u,digestHex)>=0;
+        if(fflush(stderr)!=0) testDiagnosticOkay=false;
+    }
+#endif
     const bool published=order.CompleteRecordPublication(&record);
     bool okay=published;
+#ifdef DCG01_TEST_HOOKS
+    okay=okay && testDiagnosticOkay;
+#endif
     unsigned char document[8192]{};DC022Canonical::Writer w(document,sizeof(document));
     okay=okay && w.BeginObject() && w.Key("files") && w.BeginArray() && FileWitness(w,name,record);
     if(okay)

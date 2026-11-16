@@ -9,6 +9,7 @@
 #include "distributedphysicaldisconnect.h"
 #include "distributedrecordpublication.h"
 #include <pthread.h>
+#include <stdlib.h>
 #include <string.h>
 
 namespace DCG01Terminal
@@ -17,6 +18,13 @@ enum class Origin : unsigned { Transport = 1, Admission = 2, Access = 3, Evidenc
 // Both published outcomes retain record authority; exported copies have separate availability.
 enum class PublicationResult : unsigned { Failed, Complete, ExportIncomplete };
 using HashFunction = bool (*)(const unsigned char*, size_t, unsigned char*);
+#ifdef DCG01_TEST_HOOKS
+inline bool TestT033Case(const char* expected)
+{
+    const char* selected = getenv("DCG01_TEST_T033_CASE");
+    return selected != nullptr && strcmp(selected, expected) == 0;
+}
+#endif
 struct FailureSnapshot
 {
     DistributedAdmissionThreadIdentity identity{};
@@ -223,7 +231,13 @@ public:
     bool ArtifactEvent(unsigned id, unsigned role, const unsigned char* bytes, size_t length, const unsigned char* digest)
     {
         pthread_mutex_lock(&lock);
-        const bool accepted = state.configured && !state.failed && state.identity.localNode == 1 &&
+#ifdef DCG01_TEST_HOOKS
+        const bool omitOutput = role == DCG01Preimage::ApplicationOutput && TestT033Case("t06-omit-output");
+        const bool omitEvidence = role == DCG01Preimage::TerminalEvidence && TestT033Case("t06-omit-evidence");
+#else
+        const bool omitOutput = false, omitEvidence = false;
+#endif
+        const bool accepted = !omitOutput && !omitEvidence && state.configured && !state.failed && state.identity.localNode == 1 &&
             events.CaptureArtifact(id,role,bytes,length,digest);
         if (!accepted) LatchLocked(Origin::Evidence,6,"artifact-custody-event");
         pthread_mutex_unlock(&lock);
@@ -402,7 +416,12 @@ public:
     bool RootEvent(unsigned kind, const unsigned char* objects, unsigned count)
     {
         pthread_mutex_lock(&lock);
-        const bool accepted = state.configured && !state.failed && state.identity.localNode == 1 &&
+#ifdef DCG01_TEST_HOOKS
+        const bool omitRootCut = kind == 3 && TestT033Case("t06-omit-root");
+#else
+        const bool omitRootCut = false;
+#endif
+        const bool accepted = !omitRootCut && state.configured && !state.failed && state.identity.localNode == 1 &&
             (kind == 1 ? events.InitialRootSet(objects,count) :
              !objects && count == 0 && (kind == 2 ? events.InitialRootsReady() :
              kind == 3 ? events.CaptureRootCut(1) : kind == 4 && events.CaptureRootCut(2)));
@@ -425,7 +444,12 @@ public:
                           const unsigned char* objects, unsigned count)
     {
         pthread_mutex_lock(&lock);
-        const bool accepted = state.configured && !state.failed && state.identity.localNode == 1 &&
+#ifdef DCG01_TEST_HOOKS
+        const bool omitHandoff = kind == DCG01Events::Publication::Completed && TestT033Case("t06-omit-handoff");
+#else
+        const bool omitHandoff = false;
+#endif
+        const bool accepted = !omitHandoff && state.configured && !state.failed && state.identity.localNode == 1 &&
             events.RecordPublication(kind, id, root, objects, count);
         if (!accepted) LatchLocked(Origin::Evidence,3,"publication-event-or-order");
         pthread_mutex_unlock(&lock);
@@ -437,7 +461,12 @@ public:
     {
         if (diagnostic) { *diagnostic = {}; diagnostic->actor = actor; }
         pthread_mutex_lock(&lock);
-        const bool accepted = state.configured && !state.failed && state.identity.localNode == 1 &&
+#ifdef DCG01_TEST_HOOKS
+        const bool omitEffect = request != nullptr && TestT033Case("t06-omit-effect");
+#else
+        const bool omitEffect = false;
+#endif
+        const bool accepted = !omitEffect && state.configured && !state.failed && state.identity.localNode == 1 &&
             (request ? (length == 120 && events.CommitAccess(actor, request, reply, before, diagnostic)) :
                 events.ObserveAccess(actor, reply, length, diagnostic));
         if (!accepted && diagnostic)
