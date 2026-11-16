@@ -80,7 +80,7 @@ struct Prefix
 };
 
 static const unsigned char kCommitDomain[] = "DC022-PARTICIPANT-COMMITMENT\0v1\0";
-static const unsigned char kCertificateDomain[] = "DC022-TERMINAL-CERTIFICATE\0v1\0";
+static const unsigned char kCertificateDomain[] = "DC022-TERMINAL-CERTIFICATE\0v2\0";
 static const unsigned char kRecordDomain[] = "DC022-COMPLETE-RECORD\0v1\0";
 static const unsigned char kFrontierDomain[] = "DC022-FINAL-FRONTIERS\0v1\0";
 
@@ -408,8 +408,12 @@ inline bool BuildCertificate(const Identity& x,uint64_t cutId,const MainReturn& 
     DCG01_TRY(w.Key("main_return"));DCG01_TRY(PutMain(w,main));
     DCG01_TRY(w.Key("participant_commitments"));DCG01_TRY(w.BeginArray());
     for(size_t i=0;i<2;++i){DCG01_TRY(w.BeginObject());DCG01_TRY(w.Key("commitment_bytes"));DCG01_TRY(w.UInt(frameSizes[i]));
+        DCG01_TRY(w.Key("commitment_frame_artifact_id"));DCG01_TRY(w.UInt(i==0?6:4));
         DCG01_TRY(w.Key("commitment_sha256"));DCG01_TRY(w.Hex(frameDigests[i],32));
-        DCG01_TRY(w.Key("member_id"));DCG01_TRY(w.UInt(p[i].memberId));DCG01_TRY(w.EndObject());}
+        DCG01_TRY(w.Key("member_id"));DCG01_TRY(w.UInt(p[i].memberId));
+        DCG01_TRY(w.Key("result_artifact_ids"));DCG01_TRY(w.BeginArray());
+        for(size_t j=0;j<p[i].prepared.resultArtifactCount;++j)DCG01_TRY(w.UInt(p[i].prepared.resultArtifactIds[j]));
+        DCG01_TRY(w.EndArray());DCG01_TRY(w.EndObject());}
     DCG01_TRY(w.EndArray());DCG01_TRY(w.Key("participant_cuts"));DCG01_TRY(w.BeginArray());
     for(size_t i=0;i<2;++i) DCG01_TRY(PutCut(w,x,p[i],frameDigests[i]));
     DCG01_TRY(w.EndArray());
@@ -417,7 +421,7 @@ inline bool BuildCertificate(const Identity& x,uint64_t cutId,const MainReturn& 
     DCG01_TRY(w.Key("required_terminal_evidence"));DCG01_TRY(PutManifest(w,artifacts,artifactCount,TerminalEvidence,hash));
     DCG01_TRY(w.Key("schema"));DCG01_TRY(w.String("dc022-terminal-certificate"));
     DCG01_TRY(w.Key("terminal_epoch"));DCG01_TRY(w.UInt(p[0].prepared.terminalEpoch));
-    DCG01_TRY(w.Key("version"));DCG01_TRY(w.UInt(1));DCG01_TRY(w.EndObject());DCG01_TRY(w.Finish());
+    DCG01_TRY(w.Key("version"));DCG01_TRY(w.UInt(2));DCG01_TRY(w.EndObject());DCG01_TRY(w.Finish());
     size_t n=w.Size();unsigned char localDigest[32];
     if(n>cap||!Hash(hash,tmp,n,localDigest))return false;
     memcpy(out,tmp,n);memcpy(digest,localDigest,32);*written=n;return true;

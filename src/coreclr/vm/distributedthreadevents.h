@@ -67,6 +67,7 @@ private:
     uint64_t lastRoot[2]{}, closeEvent[2]{};
     uint64_t rootCutEvent[2]{}, mainReturnEvent = 0;
     bool failureRecorded = false;
+    bool coordinatorCustodyUnavailable = false;
     struct Preparation
     {
         DCG01Preimage::Participant snapshot{};
@@ -85,7 +86,7 @@ private:
         size_t length = 0;
         uint64_t event = 0;
         unsigned char digest[32]{}, content[16384]{};
-    } artifacts[4]; // Output 1, coordinator evidence 2, worker evidence 3, received commitment body 4.
+    } artifacts[6]; // IDs 1-3 are captured outputs/evidence, 4 worker frame, 5 record, 6 coordinator frame.
 
     bool EmitRootChanges(unsigned member, const DCG01Roots::Changes& changes, bool acquire,
                          uint64_t cause, uint64_t publication = 0)
@@ -676,21 +677,37 @@ public:
 
     bool CommitLocal()
     {
-        if (!used || failureRecorded || !preparations[0].event || !preparations[1].event) return false;
+        if (!used || failureRecorded || coordinatorCustodyUnavailable || !preparations[0].event || !preparations[1].event) return false;
         if (localCommitEvent) return true;
-        if (events >= MaxEvents) return false;
+        if (events > MaxEvents - 2) { coordinatorCustodyUnavailable = true; return false; }
         const Preparation& p = preparations[0];
-        unsigned char record[2048]{};DC022Canonical::Writer w(record,sizeof(record));
+        unsigned char record[2048]{}, custody[32768]{};
+        DC022Canonical::Writer w(record,sizeof(record)), a(custody,sizeof(custody));
         bool ok = w.BeginObject() && w.Key("causes") && w.BeginArray() && w.UInt(p.event) && w.EndArray() &&
             w.Key("incarnation_id") && w.Hex(identity.memberIncarnations[0],16) &&
             w.Key("kind") && w.String("member.terminal_committed") && w.Key("member_id") && w.UInt(1) &&
             w.Key("member_seq") && w.UInt(memberEvents[0] + 1) && w.Key("payload") && w.BeginObject() &&
-            w.Key("commitment_digest") && w.Hex(p.digest,32) && w.Key("final_frontiers_digest") && w.Hex(p.frontier,32) &&
-            w.Key("output_evidence_custody_digest") && w.Hex(p.custody,32) && w.Key("root_inventory_sha256") && w.Hex(p.root,32) &&
-            w.Key("terminal_epoch") && w.UInt(1) && w.EndObject() && w.Key("record") && w.String("event") &&
+            w.Key("commitment_bytes") && w.UInt(p.length) && w.Key("commitment_digest") && w.Hex(p.digest,32) &&
+            w.Key("final_frontiers_digest") && w.Hex(p.frontier,32) &&
+            w.Key("output_evidence_custody_digest") && w.Hex(p.custody,32) &&
+            w.Key("root_inventory_sha256") && w.Hex(p.root,32) && w.Key("terminal_epoch") && w.UInt(1) &&
+            w.EndObject() && w.Key("record") && w.String("event") &&
             w.Key("trace_seq") && w.UInt(events + 1) && w.EndObject() && w.Finish();
-        if (!ok || w.Size() > MaxBytes - used) return false;
+        ok = ok && a.BeginObject() && a.Key("causes") && a.BeginArray() && a.UInt(events + 1) &&
+            a.UInt(mainReturnEvent) && a.EndArray() && a.Key("incarnation_id") && a.Hex(identity.memberIncarnations[0],16) &&
+            a.Key("kind") && a.String("artifact.custodied") && a.Key("member_id") && a.UInt(1) &&
+            a.Key("member_seq") && a.UInt(memberEvents[0] + 2) && a.Key("payload") && a.BeginObject() &&
+            a.Key("artifact_id") && a.UInt(6) && a.Key("content_b64") && a.Base64(p.body,p.length) &&
+            a.Key("content_bytes") && a.UInt(p.length) && a.Key("role") && a.String("commitment_frame") &&
+            a.Key("sha256") && a.Hex(p.digest,32) && a.EndObject() && a.Key("record") && a.String("event") &&
+            a.Key("trace_seq") && a.UInt(events + 2) && a.EndObject() && a.Finish();
+        if (!ok || w.Size() + a.Size() > MaxBytes - used)
+        { coordinatorCustodyUnavailable = true; return false; }
+        // Both records are serialized and capacity-checked before either is published.
         memcpy(bytes+used,w.Data(),w.Size());used+=w.Size();++events;++memberEvents[0];localCommitEvent=events;
+        memcpy(bytes+used,a.Data(),a.Size());used+=a.Size();++events;++memberEvents[0];
+        Artifact& frame = artifacts[5];frame.role=3;frame.length=p.length;frame.event=events;
+        memcpy(frame.content,p.body,p.length);memcpy(frame.digest,p.digest,32);
         return true;
     }
 
@@ -710,8 +727,10 @@ public:
             c.UInt(localCommitEvent) && c.UInt(artifacts[2].event) && c.EndArray() && c.Key("incarnation_id") && c.Hex(identity.memberIncarnations[1],16) &&
             c.Key("kind") && c.String("member.terminal_committed") && c.Key("member_id") && c.UInt(2) &&
             c.Key("member_seq") && c.UInt(memberEvents[1] + 1) && c.Key("payload") && c.BeginObject() &&
-            c.Key("commitment_digest") && c.Hex(p.digest,32) && c.Key("final_frontiers_digest") && c.Hex(p.frontier,32) &&
-            c.Key("output_evidence_custody_digest") && c.Hex(p.custody,32) && c.Key("root_inventory_sha256") && c.Hex(p.root,32) &&
+            c.Key("commitment_bytes") && c.UInt(p.length) && c.Key("commitment_digest") && c.Hex(p.digest,32) &&
+            c.Key("final_frontiers_digest") && c.Hex(p.frontier,32) &&
+            c.Key("output_evidence_custody_digest") && c.Hex(p.custody,32) &&
+            c.Key("root_inventory_sha256") && c.Hex(p.root,32) &&
             c.Key("terminal_epoch") && c.UInt(1) && c.EndObject() && c.Key("record") && c.String("event") &&
             c.Key("trace_seq") && c.UInt(events + 1) && c.EndObject() && c.Finish();
         ok = ok && s.BeginObject() && s.Key("causes") && s.BeginArray() && s.UInt(p.event) && s.UInt(events + 1) && s.EndArray() &&
@@ -759,14 +778,18 @@ public:
     {
         if (!used || failureRecorded || !transition || !localCommitEvent || !workerReceiptEvent) return false;
         if (workerRetirementEvent) return transition == workerRetirementOrder;
-        if (stage != 4 || !mainReturnEvent || !lastJoinReturned || !admissionClosed[0] || !admissionClosed[1] ||
+        if (coordinatorCustodyUnavailable || stage != 4 || !mainReturnEvent || !lastJoinReturned || !admissionClosed[0] || !admissionClosed[1] ||
             pending[0].active || pending[1].active || publicationStage || !rootsReady || !roots.Healthy() ||
             !roots.Closed(1) || !roots.Closed(2) || !rootCut[0] || !rootCut[1] ||
             rootCauseCount != 4 || roots.HistoricalObjects() != 4 || events >= MaxEvents) return false;
         for (unsigned i = 0; i < rootCauseCount; ++i)
             if (roots.Reasons(1,rootCauses[i].id) || roots.Reasons(2,rootCauses[i].id)) return false;
         const Preparation& p = preparations[1];
+        const Preparation& local = preparations[0];
         const Artifact& frame = artifacts[3];
+        const Artifact& coordinatorFrame = artifacts[5];
+        if (!coordinatorFrame.event || coordinatorFrame.role != 3 || coordinatorFrame.length != local.length ||
+            memcmp(coordinatorFrame.digest,local.digest,32) || memcmp(coordinatorFrame.content,local.body,local.length)) return false;
         if (!p.event || !artifacts[0].event || !artifacts[1].event || !artifacts[2].event ||
             !frame.event || frame.role != 3 || frame.length != p.length ||
             memcmp(frame.digest,p.digest,32) || memcmp(frame.content,p.body,p.length)) return false;
@@ -791,7 +814,7 @@ public:
 
     bool Seal(uint64_t transition, DCG01Preimage::HashFunction hash)
     {
-        if (!used || failureRecorded || !hash || !workerRetirementEvent || !transition) return false;
+        if (!used || failureRecorded || coordinatorCustodyUnavailable || !hash || !workerRetirementEvent || !transition) return false;
         if (Sealed()) return transition == sealArtifacts.transition;
         if (workerRetirementOrder == UINT64_MAX || transition != workerRetirementOrder+1 || events >= MaxEvents ||
             !localCommitEvent || !workerReceiptEvent || !mainReturnEvent || mainReturn.resultI32 != 0 ||
@@ -799,6 +822,14 @@ public:
             pending[0].active || pending[1].active || publicationStage) return false;
         for (unsigned i=0;i<rootCauseCount;++i)
             if (roots.Reasons(1,rootCauses[i].id) || roots.Reasons(2,rootCauses[i].id)) return false;
+        const Preparation& local = preparations[0];
+        const Preparation& remote = preparations[1];
+        const Artifact& coordinatorFrame = artifacts[5];
+        const Artifact& workerFrame = artifacts[3];
+        if (!coordinatorFrame.event || coordinatorFrame.role != 3 || coordinatorFrame.length != local.length ||
+            memcmp(coordinatorFrame.digest,local.digest,32) || memcmp(coordinatorFrame.content,local.body,local.length) ||
+            !workerFrame.event || workerFrame.role != 3 || workerFrame.length != remote.length ||
+            memcmp(workerFrame.digest,remote.digest,32) || memcmp(workerFrame.content,remote.body,remote.length)) return false;
         DCG01Preimage::Identity id{};
         memcpy(id.runId,identity.run,16);memcpy(id.buildDigest,identity.buildManifestSha256,32);
         memcpy(id.runManifestDigest,identity.runManifestSha256,32);memcpy(id.incarnation,identity.memberIncarnations,32);
