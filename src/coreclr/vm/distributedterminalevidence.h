@@ -56,7 +56,14 @@ inline DCG01Terminal::PublicationResult Publish(DCG01Terminal::FailureOrder& ord
     int directory=dcg01_raw::custody::OpenAdmittedManifestDirectory(context.manifestPath,context.manifestSha256);
     char name[DCG01Record::NameBytes]{};DCG01Record::Witness record{};
     if(directory<0){record.failure=DCG01Record::Failure::Create;record.errorNumber=errno;}
-    else if(Name(state.identity,"record",name,sizeof(name))) record=DCG01Record::Store(directory,name,seal->record,seal->recordBytes);
+    else if(Name(state.identity,"record",name,sizeof(name)))
+    {
+#if defined(DCG01_RECORD_TEST_FAULT_IO)
+        record=DCG01Record::Store<DCG01Record::FaultIO>(directory,name,seal->record,seal->recordBytes);
+#else
+        record=DCG01Record::Store(directory,name,seal->record,seal->recordBytes);
+#endif
+    }
     const bool published=order.CompleteRecordPublication(&record);
     bool okay=published;
     unsigned char document[8192]{};DC022Canonical::Writer w(document,sizeof(document));

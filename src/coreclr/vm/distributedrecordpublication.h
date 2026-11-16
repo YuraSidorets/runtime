@@ -43,6 +43,49 @@ struct System
     static bool Hash(const unsigned char* p,size_t n,unsigned char* out){return SHA256(p,n,out)!=nullptr;}
 };
 
+#if defined(DCG01_RECORD_TEST_FAULT_IO)
+// Compile-time-only fault adapter for the single coordinator record publication call.
+// Its first Write delegates exactly seven bytes to the OS; the next call reports ENOSPC.
+// Any short/failed first write or unexpected call order fails closed.
+struct FaultIO
+{
+    struct Calls
+    {
+        size_t writeCalls=0;
+        size_t realWrites=0;
+        size_t injectedFailures=0;
+        size_t unexpectedWrites=0;
+        bool firstWriteExact=false;
+    };
+    static Calls& State(){static Calls calls{};return calls;}
+    static void Reset(){State()=Calls{};}
+    static int Stat(int fd,struct stat* s){return System::Stat(fd,s);}
+    static int StatName(int fd,const char* name,struct stat* s){return System::StatName(fd,name,s);}
+    static int Open(int fd,const char* name,int flags,mode_t mode){return System::Open(fd,name,flags,mode);}
+    static ssize_t Write(int fd,const void* p,size_t n)
+    {
+        Calls& calls=State();++calls.writeCalls;
+        if(calls.writeCalls==1)
+        {
+            if(n<7){++calls.unexpectedWrites;errno=EINVAL;return -1;}
+            ++calls.realWrites;
+            const ssize_t result=System::Write(fd,p,7);
+            if(result==7){calls.firstWriteExact=true;return 7;}
+            return result;
+        }
+        if(calls.writeCalls==2 && calls.firstWriteExact)
+        {++calls.injectedFailures;errno=ENOSPC;return -1;}
+        ++calls.unexpectedWrites;errno=EIO;return -1;
+    }
+    static ssize_t Read(int fd,void* p,size_t n){return System::Read(fd,p,n);}
+    static int Chmod(int fd,mode_t mode){return System::Chmod(fd,mode);}
+    static int Sync(int fd){return System::Sync(fd);}
+    static int Close(int fd){return System::Close(fd);}
+    static int Publish(int fd,const char* pending,const char* name){return System::Publish(fd,pending,name);}
+    static bool Hash(const unsigned char* p,size_t n,unsigned char* out){return System::Hash(p,n,out);}
+};
+#endif
+
 inline bool SameFile(const struct stat& a,const struct stat& b)
 {
     return a.st_dev==b.st_dev && a.st_ino==b.st_ino && a.st_uid==b.st_uid && a.st_mode==b.st_mode &&
